@@ -1,0 +1,6 @@
+services:
+  trade_alarm_bot:
+    build: .
+    env_file:
+      - .env
+    restart: unless-stopped

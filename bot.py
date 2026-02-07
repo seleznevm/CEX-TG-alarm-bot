@@ -1,15 +1,13 @@
 import os
 import time
 import math
-import signal
 import datetime as dt
-import random
 import logging
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
-from pybit.unified_trading import WebSocket, HTTP
+from pybit.unified_trading import HTTP
 
 load_dotenv()
 
@@ -67,7 +65,7 @@ def fmt_num(x: Any, nd: int = 6) -> str:
         v = float(x)
         if math.isfinite(v):
             return f"{v:.{nd}f}".rstrip("0").rstrip(".")
-    except Exception:
+    except (ValueError, TypeError):
         pass
     return str(x)
 
@@ -78,7 +76,7 @@ def to_float(x: Any) -> Optional[float]:
             return None
         v = float(x)
         return v if math.isfinite(v) else None
-    except Exception:
+    except (ValueError, TypeError):
         return None
 
 
@@ -194,8 +192,8 @@ class BybitRest:
             if lst:
                 self._cache_put(order_id, lst[0])
                 return lst[0]
-        except Exception:
-            pass
+        except (KeyError, ValueError, TypeError) as e:
+            log.warning(f"Error getting order details with orderId: {e}")
 
         # fallback: без orderId (дороже)
         try:
@@ -205,8 +203,8 @@ class BybitRest:
                 if str(it.get("orderId", "")) == str(order_id):
                     self._cache_put(order_id, it)
                     return it
-        except Exception:
-            pass
+        except (KeyError, ValueError, TypeError) as e:
+            log.warning(f"Error getting order details (fallback): {e}")
 
         self._cache_put(order_id, {})
         return {}
@@ -240,7 +238,8 @@ class BybitRest:
                 return 100.0
             rs = avg_gain / avg_loss
             return 100.0 - (100.0 / (1.0 + rs))
-        except Exception:
+        except (KeyError, ValueError, TypeError, IndexError) as e:
+            log.warning(f"Error calculating RSI: {e}")
             return None
 
     def make_bybit_link(self, category: str, symbol: str) -> str:
@@ -260,7 +259,17 @@ class BybitRest:
 # ==========================
 # Message builder (SL/TP/RR fixed)
 # ==========================
-def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> str:
+def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> Optional[str]:
+    """
+    Строит сообщение для Telegram на основе события исполнения ордера.
+
+    Args:
+        exec_evt: Событие исполнения от Bybit
+        rest: Экземпляр BybitRest для получения дополнительных данных
+
+    Returns:
+        Отформатированное сообщение или None если не удалось построить
+    """
     category = exec_evt.get("category", "") or exec_evt.get("categoryType", "") or ""
     market_type = map_market_type(category)
 
@@ -282,6 +291,96 @@ def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> str:
     ts_ms = int(exec_evt.get("execTime", exec_evt.get("ts", 0)) or 0)
     local_dt, utc_off = utc_to_local(ts_ms, UTC_OFFSET_HOURS)
 
-    # -------- SL/TP sources priority:
-    # 1) execution fields (если вдруг есть)
-    # 2
+    # Получаем детали ордера для SL/TP
+    order_details = {}
+    if order_id and category:
+        order_details = rest.get_order_details(category, str(symbol), order_id)
+
+    # Извлекаем SL/TP
+    stop_loss = to_float(order_details.get("stopLoss"))
+    take_profit = to_float(order_details.get("takeProfit"))
+    entry_price = to_float(avg_fill_price)
+
+    # Вычисляем R:R
+    rr_ratio = None
+    if entry_price and stop_loss and take_profit:
+        rr_ratio = calc_rr(str(side), entry_price, stop_loss, take_profit)
+
+    # Получаем RSI
+    rsi = None
+    if category:
+        rsi = rest.get_rsi_4h(category, str(symbol))
+
+    # Строим сообщение
+    lines = [
+        f"🔔 <b>Исполнение ордера</b>",
+        f"",
+        f"<b>Инструмент:</b> {symbol}",
+        f"<b>Тип рынка:</b> {market_type}",
+        f"<b>Сторона:</b> {side}",
+        f"<b>Тип ордера:</b> {order_type}",
+        f"<b>Статус:</b> {order_status}",
+        f"",
+        f"<b>Цена исполнения:</b> {fmt_num(avg_fill_price)}",
+        f"<b>Объем:</b> {fmt_num(filled_qty)}",
+        f"<b>Сумма:</b> {fmt_num(filled_notional)}",
+        f"<b>Комиссия:</b> {fmt_num(fee)} {fee_coin}",
+        f"",
+    ]
+
+    # Добавляем SL/TP если есть
+    if stop_loss:
+        lines.append(f"<b>Stop Loss:</b> {fmt_num(stop_loss)}")
+    if take_profit:
+        lines.append(f"<b>Take Profit:</b> {fmt_num(take_profit)}")
+    if rr_ratio:
+        lines.append(f"<b>R:R:</b> {fmt_num(rr_ratio, 2)}")
+
+    # Добавляем RSI если есть
+    if rsi is not None:
+        lines.append(f"<b>RSI (4H):</b> {fmt_num(rsi, 2)}")
+
+    lines.extend([
+        f"",
+        f"<b>Время:</b> {local_dt} ({utc_off})",
+        f"<b>ID исполнения:</b> {exec_id}",
+        f"",
+        f"🔗 <a href='{rest.make_bybit_link(category, str(symbol))}'>Bybit</a> | "
+        f"<a href='{rest.make_tv_link(str(symbol))}'>TradingView</a>",
+    ])
+
+    return "\n".join(lines)
+
+
+# ==========================
+# Main execution (example)
+# ==========================
+if __name__ == "__main__":
+    # Проверяем обязательные переменные окружения
+    require_env("BYBIT_API_KEY", BYBIT_API_KEY)
+    require_env("BYBIT_API_SECRET", BYBIT_API_SECRET)
+    require_env("TELEGRAM_BOT_TOKEN", TG_TOKEN)
+    require_env("TELEGRAM_CHAT_ID", TG_CHAT_ID)
+
+    log.info("Starting Bybit execution listener...")
+    log.info(f"Testnet mode: {BYBIT_TESTNET}")
+
+    # Инициализация REST API клиента
+    rest_client = BybitRest(testnet=BYBIT_TESTNET)
+
+    # Пример обработки события (в реальном коде здесь будет WebSocket listener)
+    # В вашем оригинальном коде, вероятно, был WebSocket listener
+    # который вызывал build_message при получении события исполнения
+
+    log.info("Bot is ready. Waiting for execution events...")
+
+    # Здесь должна быть логика WebSocket подписки на события исполнения
+    # Например:
+    # ws = WebSocket(...)
+    # ws.execution_stream(callback=lambda msg: handle_execution(msg, rest_client))
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        log.info("Shutting down...")
