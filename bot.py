@@ -133,6 +133,7 @@ class BybitRest:
             api_secret=BYBIT_API_SECRET,
         )
         self._order_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._position_cache: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
 
     def _cache_get(self, order_id: str, ttl_sec: int) -> Optional[Dict[str, Any]]:
         item = self._order_cache.get(order_id)
@@ -150,6 +151,23 @@ class BybitRest:
             items = sorted(self._order_cache.items(), key=lambda kv: kv[1][0])
             for k, _ in items[: max(1, len(items) - max_items)]:
                 self._order_cache.pop(k, None)
+
+    def _position_cache_get(self, key: Tuple[str, str], ttl_sec: int) -> Optional[Dict[str, Any]]:
+        item = self._position_cache.get(key)
+        if not item:
+            return None
+        ts, data = item
+        if time.time() - ts > ttl_sec:
+            self._position_cache.pop(key, None)
+            return None
+        return data
+
+    def _position_cache_put(self, key: Tuple[str, str], data: Dict[str, Any], max_items: int) -> None:
+        self._position_cache[key] = (time.time(), data)
+        if len(self._position_cache) > max_items:
+            items = sorted(self._position_cache.items(), key=lambda kv: kv[1][0])
+            for k, _ in items[: max(1, len(items) - max_items)]:
+                self._position_cache.pop(k, None)
 
     def get_order_details(self, category: str, symbol: str, order_id: str,
                           cache_ttl_sec: int = 3600, cache_max: int = 3000) -> Dict[str, Any]:
@@ -185,6 +203,29 @@ class BybitRest:
             log.warning(f"Order details fallback failed: {e}")
 
         self._cache_put(order_id, {}, cache_max)
+        return {}
+
+    def get_position_details(self, category: str, symbol: str,
+                             cache_ttl_sec: int = 15, cache_max: int = 2000) -> Dict[str, Any]:
+        c = (category or "").lower()
+        if not c or not symbol:
+            return {}
+
+        key = (c, symbol)
+        cached = self._position_cache_get(key, cache_ttl_sec)
+        if cached is not None:
+            return cached
+
+        try:
+            resp = self.http.get_positions(category=c, symbol=symbol)
+            lst = (((resp or {}).get("result") or {}).get("list") or [])
+            if lst:
+                self._position_cache_put(key, lst[0], cache_max)
+                return lst[0]
+        except Exception as e:
+            log.warning(f"Position details failed: {e}")
+
+        self._position_cache_put(key, {}, cache_max)
         return {}
 
     def get_rsi_4h(self, category: str, symbol: str, length: int = 14) -> Optional[float]:
@@ -257,15 +298,36 @@ def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> str:
 
     fee = exec_evt.get("execFee", "—")
     fee_coin = exec_evt.get("feeCurrency", exec_evt.get("feeCoin", "—"))
+    pnl_coin = exec_evt.get("pnlCurrency", exec_evt.get("profitCurrency", fee_coin or "USDT"))
+    realized_pnl = to_float(exec_evt.get("execPnl") or exec_evt.get("realizedPnl") or exec_evt.get("closedPnl"))
+    current_pnl = to_float(
+        exec_evt.get("pnl")
+        or exec_evt.get("unrealizedPnl")
+        or exec_evt.get("unrealisedPnl")
+        or exec_evt.get("cumPnl")
+        or exec_evt.get("positionPnl")
+    )
 
     ts_ms = int(exec_evt.get("execTime", exec_evt.get("ts", 0)) or 0)
     local_dt, utc_off = utc_to_local(ts_ms, UTC_OFFSET_HOURS)
 
     # Pull SL/TP from order history (if possible)
     order_details = rest.get_order_details(category, symbol, order_id) if (order_id and category) else {}
+    if order_status in ("—", "", None):
+        order_status = order_details.get("orderStatus", "—")
+    if realized_pnl is None:
+        realized_pnl = to_float(order_details.get("closedPnl") or order_details.get("realizedPnl"))
     stop_loss = to_float(order_details.get("stopLoss"))
     take_profit = to_float(order_details.get("takeProfit"))
     entry_price = to_float(avg_fill_price)
+
+    if current_pnl is None and category:
+        position_details = rest.get_position_details(category, symbol)
+        current_pnl = to_float(
+            position_details.get("unrealisedPnl")
+            or position_details.get("unrealizedPnl")
+            or position_details.get("pnl")
+        )
 
     rr_ratio = calc_rr(side, entry_price, stop_loss, take_profit)
 
@@ -290,6 +352,11 @@ def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> str:
         f"<b>Сумма:</b> {fmt_num(filled_notional)}",
         f"<b>Комиссия:</b> {fmt_num(fee)} {fee_coin}",
     ]
+
+    if realized_pnl is not None:
+        lines.append(f"<b>Реализованный PnL:</b> {fmt_num(realized_pnl)} {pnl_coin}")
+    if current_pnl is not None:
+        lines.append(f"<b>Текущий PnL:</b> {fmt_num(current_pnl)} {pnl_coin}")
 
     if stop_loss is not None:
         lines.append(f"<b>Stop Loss:</b> {fmt_num(stop_loss)}")

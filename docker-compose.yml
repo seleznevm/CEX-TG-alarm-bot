@@ -1,6 +1,9 @@
 services:
   trade_alarm_bot:
-    build: .
+    build:
+      context: .
+      args:
+        BUILD_ID: "1"
     env_file:
       - .env
     restart: unless-stopped
