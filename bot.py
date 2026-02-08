@@ -14,6 +14,7 @@ load_dotenv()
 # ==========================
 # Config
 # ==========================
+BOT_VERSION = "1.2"
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "")
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
 BYBIT_TESTNET = os.environ.get("BYBIT_TESTNET", "0") == "1"
@@ -427,7 +428,7 @@ def main() -> None:
     require_env("BYBIT_API_SECRET", BYBIT_API_SECRET)
     require_env("TELEGRAM_BOT_TOKEN", TG_TOKEN)
     require_env("TELEGRAM_CHAT_ID", TG_CHAT_ID)
-
+    print("BOT VERSION: " + BOT_VERSION)
     log.info("Starting Bybit WS execution listener...")
     log.info(f"Testnet: {BYBIT_TESTNET}")
 
