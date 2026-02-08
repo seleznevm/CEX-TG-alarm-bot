@@ -3,11 +3,11 @@ import time
 import math
 import datetime as dt
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Set
 
 import requests
 from dotenv import load_dotenv
-from pybit.unified_trading import HTTP
+from pybit.unified_trading import HTTP, WebSocket
 
 load_dotenv()
 
@@ -24,17 +24,7 @@ TG_THREAD_ID = os.environ.get("TELEGRAM_THREAD_ID", "")
 
 UTC_OFFSET_HOURS = int(os.environ.get("UTC_OFFSET_HOURS", "7"))
 
-# Safety limits
 EXECID_CACHE_MAX = int(os.environ.get("EXECID_CACHE_MAX", "5000"))
-
-# WS reconnect tuning
-WS_PING_INTERVAL_SEC = int(os.environ.get("WS_PING_INTERVAL_SEC", "20"))
-WS_PING_TIMEOUT_SEC = int(os.environ.get("WS_PING_TIMEOUT_SEC", "10"))
-WS_RECONNECT_MAX_SLEEP_SEC = int(os.environ.get("WS_RECONNECT_MAX_SLEEP_SEC", "60"))
-
-# REST cache tuning
-ORDER_CACHE_MAX = int(os.environ.get("ORDER_CACHE_MAX", "3000"))
-ORDER_CACHE_TTL_SEC = int(os.environ.get("ORDER_CACHE_TTL_SEC", "3600"))
 
 # Logging
 logging.basicConfig(
@@ -94,11 +84,6 @@ def map_market_type(category: str) -> str:
 
 
 def calc_rr(side: str, entry: Optional[float], sl: Optional[float], tp: Optional[float]) -> Optional[float]:
-    """
-    R:R = Reward / Risk
-    Long: reward = tp-entry, risk = entry-sl
-    Short: reward = entry-tp, risk = sl-entry
-    """
     if entry is None or sl is None or tp is None:
         return None
 
@@ -125,6 +110,7 @@ def tg_send_message(text: str) -> None:
     payload: Dict[str, Any] = {
         "chat_id": TG_CHAT_ID,
         "text": text,
+        "parse_mode": "HTML",  # IMPORTANT for <b> and <a>
         "disable_web_page_preview": True,
     }
     if TG_THREAD_ID:
@@ -146,71 +132,65 @@ class BybitRest:
             api_key=BYBIT_API_KEY,
             api_secret=BYBIT_API_SECRET,
         )
-        # order cache: orderId -> (ts, details)
         self._order_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
-    def _cache_get(self, order_id: str) -> Optional[Dict[str, Any]]:
+    def _cache_get(self, order_id: str, ttl_sec: int) -> Optional[Dict[str, Any]]:
         item = self._order_cache.get(order_id)
         if not item:
             return None
         ts, data = item
-        if time.time() - ts > ORDER_CACHE_TTL_SEC:
+        if time.time() - ts > ttl_sec:
             self._order_cache.pop(order_id, None)
             return None
         return data
 
-    def _cache_put(self, order_id: str, data: Dict[str, Any]) -> None:
+    def _cache_put(self, order_id: str, data: Dict[str, Any], max_items: int) -> None:
         self._order_cache[order_id] = (time.time(), data)
-        if len(self._order_cache) > ORDER_CACHE_MAX:
+        if len(self._order_cache) > max_items:
             items = sorted(self._order_cache.items(), key=lambda kv: kv[1][0])
-            for k, _ in items[: max(1, len(items) - ORDER_CACHE_MAX)]:
+            for k, _ in items[: max(1, len(items) - max_items)]:
                 self._order_cache.pop(k, None)
 
-    def get_position_info(self, category: str, symbol: str) -> Dict[str, Any]:
-        c = (category or "").lower()
-        if c not in ("linear", "inverse"):
-            return {}
-        resp = self.http.get_positions(category=c, symbol=symbol)
-        lst = (((resp or {}).get("result") or {}).get("list") or [])
-        return lst[0] if lst else {}
-
-    def get_order_details(self, category: str, symbol: str, order_id: str) -> Dict[str, Any]:
-        """
-        Пытаемся вытащить stopLoss/takeProfit из истории ордера.
-        """
+    def get_order_details(self, category: str, symbol: str, order_id: str,
+                          cache_ttl_sec: int = 3600, cache_max: int = 3000) -> Dict[str, Any]:
         if not order_id:
             return {}
 
-        cached = self._cache_get(order_id)
+        cached = self._cache_get(order_id, cache_ttl_sec)
         if cached is not None:
             return cached
 
-        c = (category or "").lower() or "linear"
+        c = (category or "").lower()
+        if not c:
+            return {}
+
         try:
             resp = self.http.get_order_history(category=c, symbol=symbol, orderId=order_id, limit=50)
             lst = (((resp or {}).get("result") or {}).get("list") or [])
             if lst:
-                self._cache_put(order_id, lst[0])
+                self._cache_put(order_id, lst[0], cache_max)
                 return lst[0]
-        except (KeyError, ValueError, TypeError) as e:
-            log.warning(f"Error getting order details with orderId: {e}")
+        except Exception as e:
+            log.warning(f"Order details by orderId failed: {e}")
 
-        # fallback: без orderId (дороже)
+        # fallback: without orderId
         try:
             resp = self.http.get_order_history(category=c, symbol=symbol, limit=50)
             lst = (((resp or {}).get("result") or {}).get("list") or [])
             for it in lst:
                 if str(it.get("orderId", "")) == str(order_id):
-                    self._cache_put(order_id, it)
+                    self._cache_put(order_id, it, cache_max)
                     return it
-        except (KeyError, ValueError, TypeError) as e:
-            log.warning(f"Error getting order details (fallback): {e}")
+        except Exception as e:
+            log.warning(f"Order details fallback failed: {e}")
 
-        self._cache_put(order_id, {})
+        self._cache_put(order_id, {}, cache_max)
         return {}
 
     def get_rsi_4h(self, category: str, symbol: str, length: int = 14) -> Optional[float]:
         c = (category or "").lower()
+        if not c:
+            return None
         try:
             resp = self.http.get_kline(category=c, symbol=symbol, interval="240", limit=200)
             rows = (((resp or {}).get("result") or {}).get("list") or [])
@@ -238,8 +218,8 @@ class BybitRest:
                 return 100.0
             rs = avg_gain / avg_loss
             return 100.0 - (100.0 / (1.0 + rs))
-        except (KeyError, ValueError, TypeError, IndexError) as e:
-            log.warning(f"Error calculating RSI: {e}")
+        except Exception as e:
+            log.warning(f"RSI calc failed: {e}")
             return None
 
     def make_bybit_link(self, category: str, symbol: str) -> str:
@@ -257,28 +237,18 @@ class BybitRest:
 
 
 # ==========================
-# Message builder (SL/TP/RR fixed)
+# Message builder
 # ==========================
-def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> Optional[str]:
-    """
-    Строит сообщение для Telegram на основе события исполнения ордера.
-
-    Args:
-        exec_evt: Событие исполнения от Bybit
-        rest: Экземпляр BybitRest для получения дополнительных данных
-
-    Returns:
-        Отформатированное сообщение или None если не удалось построить
-    """
+def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> str:
     category = exec_evt.get("category", "") or exec_evt.get("categoryType", "") or ""
     market_type = map_market_type(category)
 
-    symbol = exec_evt.get("symbol", "—")
-    side = exec_evt.get("side", "—")
+    symbol = str(exec_evt.get("symbol", "—"))
+    side = str(exec_evt.get("side", "—"))
     order_type = exec_evt.get("orderType", exec_evt.get("order_type", "—"))
     order_status = exec_evt.get("orderStatus", exec_evt.get("order_status", "—"))
 
-    exec_id = exec_evt.get("execId", exec_evt.get("exec_id", "—"))
+    exec_id = str(exec_evt.get("execId", exec_evt.get("exec_id", "—")))
     order_id = str(exec_evt.get("orderId", exec_evt.get("order_id", "")) or "")
 
     avg_fill_price = exec_evt.get("execPrice", exec_evt.get("price", "—"))
@@ -291,96 +261,130 @@ def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> Optional[str]:
     ts_ms = int(exec_evt.get("execTime", exec_evt.get("ts", 0)) or 0)
     local_dt, utc_off = utc_to_local(ts_ms, UTC_OFFSET_HOURS)
 
-    # Получаем детали ордера для SL/TP
-    order_details = {}
-    if order_id and category:
-        order_details = rest.get_order_details(category, str(symbol), order_id)
-
-    # Извлекаем SL/TP
+    # Pull SL/TP from order history (if possible)
+    order_details = rest.get_order_details(category, symbol, order_id) if (order_id and category) else {}
     stop_loss = to_float(order_details.get("stopLoss"))
     take_profit = to_float(order_details.get("takeProfit"))
     entry_price = to_float(avg_fill_price)
 
-    # Вычисляем R:R
-    rr_ratio = None
-    if entry_price and stop_loss and take_profit:
-        rr_ratio = calc_rr(str(side), entry_price, stop_loss, take_profit)
+    rr_ratio = calc_rr(side, entry_price, stop_loss, take_profit)
 
-    # Получаем RSI
-    rsi = None
-    if category:
-        rsi = rest.get_rsi_4h(category, str(symbol))
+    rsi = rest.get_rsi_4h(category, symbol, length=14)
+    rsi_str = fmt_num(rsi, 2) if rsi is not None else "n/a"
 
-    # Строим сообщение
+    bybit_link = rest.make_bybit_link(category, symbol)
+    tv_link = rest.make_tv_link(symbol)
+
     lines = [
-        f"🔔 <b>Исполнение ордера</b>",
-        f"",
-        f"<b>Инструмент:</b> {symbol}",
+        "🔔 <b>Исполнение ордера</b>",
+        "",
+        f"<b>Биржа:</b> Bybit",
         f"<b>Тип рынка:</b> {market_type}",
+        f"<b>Инструмент:</b> {symbol}",
         f"<b>Сторона:</b> {side}",
         f"<b>Тип ордера:</b> {order_type}",
         f"<b>Статус:</b> {order_status}",
-        f"",
+        "",
         f"<b>Цена исполнения:</b> {fmt_num(avg_fill_price)}",
         f"<b>Объем:</b> {fmt_num(filled_qty)}",
         f"<b>Сумма:</b> {fmt_num(filled_notional)}",
         f"<b>Комиссия:</b> {fmt_num(fee)} {fee_coin}",
-        f"",
     ]
 
-    # Добавляем SL/TP если есть
-    if stop_loss:
+    if stop_loss is not None:
         lines.append(f"<b>Stop Loss:</b> {fmt_num(stop_loss)}")
-    if take_profit:
+    if take_profit is not None:
         lines.append(f"<b>Take Profit:</b> {fmt_num(take_profit)}")
-    if rr_ratio:
+    if rr_ratio is not None:
         lines.append(f"<b>R:R:</b> {fmt_num(rr_ratio, 2)}")
 
-    # Добавляем RSI если есть
-    if rsi is not None:
-        lines.append(f"<b>RSI (4H):</b> {fmt_num(rsi, 2)}")
-
-    lines.extend([
-        f"",
+    lines += [
+        f"<b>RSI (4H):</b> {rsi_str}",
+        "",
         f"<b>Время:</b> {local_dt} ({utc_off})",
         f"<b>ID исполнения:</b> {exec_id}",
-        f"",
-        f"🔗 <a href='{rest.make_bybit_link(category, str(symbol))}'>Bybit</a> | "
-        f"<a href='{rest.make_tv_link(str(symbol))}'>TradingView</a>",
-    ])
+        f"<b>Order ID:</b> {order_id}",
+        "",
+        f"🔗 <a href='{bybit_link}'>Bybit</a> | <a href='{tv_link}'>TradingView</a>",
+    ]
 
     return "\n".join(lines)
 
 
 # ==========================
-# Main execution (example)
+# WS handler
 # ==========================
-if __name__ == "__main__":
-    # Проверяем обязательные переменные окружения
+execid_seen: Set[str] = set()
+
+
+def trim_exec_cache() -> None:
+    global execid_seen
+    if len(execid_seen) <= EXECID_CACHE_MAX:
+        return
+    execid_seen = set(list(execid_seen)[-EXECID_CACHE_MAX:])
+
+
+def on_execution_message(message: Dict[str, Any], rest: BybitRest) -> None:
+    # Debug one-liner (uncomment if needed)
+    # log.debug(f"WS raw: {message}")
+
+    data = message.get("data") or []
+    if not isinstance(data, list):
+        return
+
+    for evt in data:
+        exec_type = (evt.get("execType") or evt.get("exec_type") or "").lower()
+        if exec_type and exec_type != "trade":
+            continue
+
+        exec_id = str(evt.get("execId", "") or "")
+        if not exec_id:
+            continue
+
+        if exec_id in execid_seen:
+            return
+
+        execid_seen.add(exec_id)
+        trim_exec_cache()
+
+        try:
+            text = build_message(evt, rest)
+            tg_send_message(text)
+            log.info(f"Sent execId={exec_id}")
+        except Exception as e:
+            log.exception(f"Failed processing execId={exec_id}: {e}")
+
+
+def main() -> None:
     require_env("BYBIT_API_KEY", BYBIT_API_KEY)
     require_env("BYBIT_API_SECRET", BYBIT_API_SECRET)
     require_env("TELEGRAM_BOT_TOKEN", TG_TOKEN)
     require_env("TELEGRAM_CHAT_ID", TG_CHAT_ID)
 
-    log.info("Starting Bybit execution listener...")
-    log.info(f"Testnet mode: {BYBIT_TESTNET}")
+    log.info("Starting Bybit WS execution listener...")
+    log.info(f"Testnet: {BYBIT_TESTNET}")
 
-    # Инициализация REST API клиента
-    rest_client = BybitRest(testnet=BYBIT_TESTNET)
+    rest = BybitRest(testnet=BYBIT_TESTNET)
 
-    # Пример обработки события (в реальном коде здесь будет WebSocket listener)
-    # В вашем оригинальном коде, вероятно, был WebSocket listener
-    # который вызывал build_message при получении события исполнения
+    ws = WebSocket(
+        testnet=BYBIT_TESTNET,
+        channel_type="private",
+        api_key=BYBIT_API_KEY,
+        api_secret=BYBIT_API_SECRET,
+    )
 
-    log.info("Bot is ready. Waiting for execution events...")
+    # IMPORTANT: subscribe to private execution stream
+    ws.subscribe(
+        topic="execution",
+        callback=lambda msg: on_execution_message(msg, rest),
+    )
 
-    # Здесь должна быть логика WebSocket подписки на события исполнения
-    # Например:
-    # ws = WebSocket(...)
-    # ws.execution_stream(callback=lambda msg: handle_execution(msg, rest_client))
+    log.info("Subscribed to private topic: execution")
+    log.info("Waiting for execution events...")
 
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        log.info("Shutting down...")
+    while True:
+        time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()
