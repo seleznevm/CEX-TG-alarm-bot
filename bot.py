@@ -3,7 +3,9 @@ import time
 import math
 import datetime as dt
 import logging
-from typing import Any, Dict, Optional, Tuple, Set
+import threading
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import requests
 from dotenv import load_dotenv
@@ -14,7 +16,7 @@ load_dotenv()
 # ==========================
 # Config
 # ==========================
-BOT_VERSION = "1.2"
+BOT_VERSION = "1.3"
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "")
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
 BYBIT_TESTNET = os.environ.get("BYBIT_TESTNET", "0") == "1"
@@ -24,8 +26,8 @@ TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TG_THREAD_ID = os.environ.get("TELEGRAM_THREAD_ID", "")
 
 UTC_OFFSET_HOURS = int(os.environ.get("UTC_OFFSET_HOURS", "7"))
-
 EXECID_CACHE_MAX = int(os.environ.get("EXECID_CACHE_MAX", "5000"))
+ORDER_AGGREGATION_WINDOW_SEC = int(os.environ.get("ORDER_AGGREGATION_WINDOW_SEC", "8"))
 
 # Logging
 logging.basicConfig(
@@ -111,7 +113,7 @@ def tg_send_message(text: str) -> None:
     payload: Dict[str, Any] = {
         "chat_id": TG_CHAT_ID,
         "text": text,
-        "parse_mode": "HTML",  # IMPORTANT for <b> and <a>
+        "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
     if TG_THREAD_ID:
@@ -192,7 +194,6 @@ class BybitRest:
         except Exception as e:
             log.warning(f"Order details by orderId failed: {e}")
 
-        # fallback: without orderId
         try:
             resp = self.http.get_order_history(category=c, symbol=symbol, limit=50)
             lst = (((resp or {}).get("result") or {}).get("list") or [])
@@ -291,6 +292,7 @@ def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> str:
     order_status = exec_evt.get("orderStatus", exec_evt.get("order_status", "—"))
 
     exec_id = str(exec_evt.get("execId", exec_evt.get("exec_id", "—")))
+    exec_count = int(exec_evt.get("aggregatedExecCount", 1) or 1)
     order_id = str(exec_evt.get("orderId", exec_evt.get("order_id", "")) or "")
 
     avg_fill_price = exec_evt.get("execPrice", exec_evt.get("price", "—"))
@@ -312,7 +314,6 @@ def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> str:
     ts_ms = int(exec_evt.get("execTime", exec_evt.get("ts", 0)) or 0)
     local_dt, utc_off = utc_to_local(ts_ms, UTC_OFFSET_HOURS)
 
-    # Pull SL/TP from order history (if possible)
     order_details = rest.get_order_details(category, symbol, order_id) if (order_id and category) else {}
     if order_status in ("—", "", None):
         order_status = order_details.get("orderStatus", "—")
@@ -331,7 +332,6 @@ def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> str:
         )
 
     rr_ratio = calc_rr(side, entry_price, stop_loss, take_profit)
-
     rsi = rest.get_rsi_4h(category, symbol, length=14)
     rsi_str = fmt_num(rsi, 2) if rsi is not None else "n/a"
 
@@ -348,11 +348,14 @@ def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> str:
         f"<b>Тип ордера:</b> {order_type}",
         f"<b>Статус:</b> {order_status}",
         "",
-        f"<b>Цена исполнения:</b> {fmt_num(avg_fill_price)}",
-        f"<b>Объем:</b> {fmt_num(filled_qty)}",
+        f"<b>Средняя цена исполнения:</b> {fmt_num(avg_fill_price)}",
+        f"<b>Суммарный объем:</b> {fmt_num(filled_qty)}",
         f"<b>Сумма:</b> {fmt_num(filled_notional)}",
-        f"<b>Комиссия:</b> {fmt_num(fee)} {fee_coin}",
+        f"<b>Суммарная комиссия:</b> {fmt_num(fee)} {fee_coin}",
     ]
+
+    if exec_count > 1:
+        lines.append(f"<b>Количество исполнений:</b> {exec_count}")
 
     if realized_pnl is not None:
         lines.append(f"<b>Реализованный PnL:</b> {fmt_num(realized_pnl)} {pnl_coin}")
@@ -380,47 +383,236 @@ def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> str:
 
 
 # ==========================
+# Aggregation
+# ==========================
+@dataclass
+class AggregatedOrder:
+    key: str
+    category: str
+    symbol: str
+    side: str
+    order_type: str
+    order_status: str
+    order_id: str
+    fee_coin: str
+    pnl_coin: str
+    total_qty: float = 0.0
+    total_notional: float = 0.0
+    total_fee: float = 0.0
+    total_realized_pnl: float = 0.0
+    has_realized_pnl: bool = False
+    current_pnl: Optional[float] = None
+    first_ts_ms: int = 0
+    last_ts_ms: int = 0
+    last_exec_id: str = ""
+    exec_ids: List[str] = field(default_factory=list)
+
+
+class ExecutionAggregator:
+    def __init__(self, window_sec: int):
+        self.window_sec = max(1, window_sec)
+        self._lock = threading.Lock()
+        self._execid_seen: Set[str] = set()
+        self._pending_orders: Dict[str, AggregatedOrder] = {}
+
+    @staticmethod
+    def _order_key(evt: Dict[str, Any]) -> Optional[str]:
+        order_id = str(evt.get("orderId", evt.get("order_id", "")) or "")
+        if order_id:
+            return f"order:{order_id}"
+        return None
+
+    @staticmethod
+    def _is_trade(evt: Dict[str, Any]) -> bool:
+        exec_type = (evt.get("execType") or evt.get("exec_type") or "").lower()
+        return not exec_type or exec_type == "trade"
+
+    @staticmethod
+    def _should_flush(evt: Dict[str, Any]) -> bool:
+        status = str(evt.get("orderStatus", evt.get("order_status", "")) or "").lower()
+        if status in {"filled", "cancelled", "rejected", "deactivated", "partiallyfilledcanceled"}:
+            return True
+
+        leaves_qty = to_float(evt.get("leavesQty") or evt.get("leaves_qty"))
+        if leaves_qty is not None and leaves_qty <= 0:
+            return True
+
+        cum_exec_qty = to_float(evt.get("cumExecQty") or evt.get("cum_exec_qty"))
+        order_qty = to_float(evt.get("orderQty") or evt.get("order_qty"))
+        if cum_exec_qty is not None and order_qty is not None and order_qty > 0 and cum_exec_qty >= order_qty:
+            return True
+
+        return False
+
+    @staticmethod
+    def _build_event_from_agg(agg: AggregatedOrder) -> Dict[str, Any]:
+        avg_price = agg.total_notional / agg.total_qty if agg.total_qty > 0 else 0.0
+        return {
+            "category": agg.category,
+            "symbol": agg.symbol,
+            "side": agg.side,
+            "orderType": agg.order_type,
+            "orderStatus": agg.order_status,
+            "orderId": agg.order_id,
+            "execId": agg.last_exec_id,
+            "execTime": agg.last_ts_ms,
+            "execPrice": avg_price,
+            "execQty": agg.total_qty,
+            "execValue": agg.total_notional,
+            "execFee": agg.total_fee,
+            "feeCurrency": agg.fee_coin,
+            "pnlCurrency": agg.pnl_coin,
+            "aggregatedExecCount": len(agg.exec_ids),
+            "realizedPnl": agg.total_realized_pnl if agg.has_realized_pnl else None,
+            "pnl": agg.current_pnl,
+        }
+
+    def _trim_exec_cache(self) -> None:
+        if len(self._execid_seen) <= EXECID_CACHE_MAX:
+            return
+        self._execid_seen = set(list(self._execid_seen)[-EXECID_CACHE_MAX:])
+
+    def _apply_execution(self, evt: Dict[str, Any], key: str) -> AggregatedOrder:
+        ts_ms = int(evt.get("execTime", evt.get("ts", 0)) or 0)
+        agg = self._pending_orders.get(key)
+
+        if agg is None:
+            agg = AggregatedOrder(
+                key=key,
+                category=str(evt.get("category", evt.get("categoryType", "")) or ""),
+                symbol=str(evt.get("symbol", "—")),
+                side=str(evt.get("side", "—")),
+                order_type=str(evt.get("orderType", evt.get("order_type", "—"))),
+                order_status=str(evt.get("orderStatus", evt.get("order_status", "—"))),
+                order_id=str(evt.get("orderId", evt.get("order_id", "")) or ""),
+                fee_coin=str(evt.get("feeCurrency", evt.get("feeCoin", "—"))),
+                pnl_coin=str(evt.get("pnlCurrency", evt.get("profitCurrency", "USDT"))),
+                first_ts_ms=ts_ms,
+                last_ts_ms=ts_ms,
+            )
+            self._pending_orders[key] = agg
+
+        qty = to_float(evt.get("execQty", evt.get("qty", 0))) or 0.0
+        notional = to_float(evt.get("execValue", evt.get("value", 0)))
+        exec_price = to_float(evt.get("execPrice", evt.get("price", 0))) or 0.0
+        fee = to_float(evt.get("execFee")) or 0.0
+
+        if notional is None:
+            notional = exec_price * qty
+
+        realized = to_float(evt.get("execPnl") or evt.get("realizedPnl") or evt.get("closedPnl"))
+        current_pnl = to_float(
+            evt.get("pnl")
+            or evt.get("unrealizedPnl")
+            or evt.get("unrealisedPnl")
+            or evt.get("cumPnl")
+            or evt.get("positionPnl")
+        )
+
+        agg.total_qty += qty
+        agg.total_notional += notional
+        agg.total_fee += fee
+        if realized is not None:
+            agg.has_realized_pnl = True
+            agg.total_realized_pnl += realized
+        if current_pnl is not None:
+            agg.current_pnl = current_pnl
+
+        agg.last_ts_ms = ts_ms
+        agg.last_exec_id = str(evt.get("execId", evt.get("exec_id", "—")))
+        agg.exec_ids.append(agg.last_exec_id)
+
+        status = str(evt.get("orderStatus", evt.get("order_status", "")) or "")
+        if status:
+            agg.order_status = status
+
+        return agg
+
+    def process_ws_message(self, message: Dict[str, Any]) -> List[Dict[str, Any]]:
+        ready_events: List[Dict[str, Any]] = []
+        data = message.get("data") or []
+        if not isinstance(data, list):
+            return ready_events
+
+        with self._lock:
+            for evt in data:
+                if not self._is_trade(evt):
+                    continue
+
+                exec_id = str(evt.get("execId", evt.get("exec_id", "")) or "")
+                if not exec_id:
+                    continue
+
+                if exec_id in self._execid_seen:
+                    continue
+
+                self._execid_seen.add(exec_id)
+                self._trim_exec_cache()
+
+                key = self._order_key(evt)
+                if not key:
+                    # безопасный fallback: если orderId нет, не агрегируем чужие ордера
+                    ready_events.append(evt)
+                    continue
+
+                agg = self._apply_execution(evt, key)
+                if self._should_flush(evt):
+                    self._pending_orders.pop(key, None)
+                    ready_events.append(self._build_event_from_agg(agg))
+
+        return ready_events
+
+    def flush_due(self) -> List[Dict[str, Any]]:
+        now = time.time()
+        ready_events: List[Dict[str, Any]] = []
+
+        with self._lock:
+            due_keys = [
+                key for key, agg in self._pending_orders.items()
+                if agg.last_ts_ms and (now - agg.last_ts_ms / 1000.0) >= self.window_sec
+            ]
+            for key in due_keys:
+                agg = self._pending_orders.pop(key, None)
+                if not agg:
+                    continue
+                ready_events.append(self._build_event_from_agg(agg))
+
+        return ready_events
+
+
+# ==========================
 # WS handler
 # ==========================
-execid_seen: Set[str] = set()
+aggregator = ExecutionAggregator(window_sec=ORDER_AGGREGATION_WINDOW_SEC)
 
 
-def trim_exec_cache() -> None:
-    global execid_seen
-    if len(execid_seen) <= EXECID_CACHE_MAX:
-        return
-    execid_seen = set(list(execid_seen)[-EXECID_CACHE_MAX:])
+def send_event_message(evt: Dict[str, Any], rest: BybitRest, reason: str) -> None:
+    text = build_message(evt, rest)
+    tg_send_message(text)
+    log.info(
+        "Sent aggregated order reason=%s orderId=%s executions=%s",
+        reason,
+        evt.get("orderId", ""),
+        evt.get("aggregatedExecCount", 1),
+    )
 
 
 def on_execution_message(message: Dict[str, Any], rest: BybitRest) -> None:
-    # Debug one-liner (uncomment if needed)
-    # log.debug(f"WS raw: {message}")
+    try:
+        for evt in aggregator.process_ws_message(message):
+            send_event_message(evt, rest, reason="event")
+    except Exception as e:
+        log.exception(f"Failed processing WS message: {e}")
 
-    data = message.get("data") or []
-    if not isinstance(data, list):
-        return
 
-    for evt in data:
-        exec_type = (evt.get("execType") or evt.get("exec_type") or "").lower()
-        if exec_type and exec_type != "trade":
-            continue
-
-        exec_id = str(evt.get("execId", "") or "")
-        if not exec_id:
-            continue
-
-        if exec_id in execid_seen:
-            return
-
-        execid_seen.add(exec_id)
-        trim_exec_cache()
-
+def flush_loop(rest: BybitRest) -> None:
+    while True:
         try:
-            text = build_message(evt, rest)
-            tg_send_message(text)
-            log.info(f"Sent execId={exec_id}")
+            for evt in aggregator.flush_due():
+                send_event_message(evt, rest, reason="timeout")
         except Exception as e:
-            log.exception(f"Failed processing execId={exec_id}: {e}")
+            log.exception(f"Failed flushing aggregated orders: {e}")
+        time.sleep(1)
 
 
 def main() -> None:
@@ -428,11 +620,15 @@ def main() -> None:
     require_env("BYBIT_API_SECRET", BYBIT_API_SECRET)
     require_env("TELEGRAM_BOT_TOKEN", TG_TOKEN)
     require_env("TELEGRAM_CHAT_ID", TG_CHAT_ID)
+
     print("BOT VERSION: " + BOT_VERSION)
     log.info("Starting Bybit WS execution listener...")
-    log.info(f"Testnet: {BYBIT_TESTNET}")
+    log.info("Testnet: %s", BYBIT_TESTNET)
 
     rest = BybitRest(testnet=BYBIT_TESTNET)
+
+    flush_thread = threading.Thread(target=flush_loop, args=(rest,), daemon=True, name="agg-flush-loop")
+    flush_thread.start()
 
     ws = WebSocket(
         testnet=BYBIT_TESTNET,
@@ -441,7 +637,6 @@ def main() -> None:
         api_secret=BYBIT_API_SECRET,
     )
 
-    # IMPORTANT: subscribe to private execution stream
     ws.subscribe(
         topic="execution",
         callback=lambda msg: on_execution_message(msg, rest),
