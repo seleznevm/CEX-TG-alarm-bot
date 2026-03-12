@@ -16,30 +16,19 @@ load_dotenv()
 # ==========================
 # Config
 # ==========================
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-BOT_VERSION = "1.3"
-=======
 BOT_VERSION = "1.4"
->>>>>>> theirs
-=======
-BOT_VERSION = "1.4"
->>>>>>> theirs
-=======
-BOT_VERSION = "1.4"
->>>>>>> theirs
-BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "")
-BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
+BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
+BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
 BYBIT_TESTNET = os.environ.get("BYBIT_TESTNET", "0") == "1"
 
-TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-TG_THREAD_ID = os.environ.get("TELEGRAM_THREAD_ID", "")
+TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+TG_THREAD_ID = os.environ.get("TELEGRAM_THREAD_ID", "").strip()
 
 UTC_OFFSET_HOURS = int(os.environ.get("UTC_OFFSET_HOURS", "7"))
 EXECID_CACHE_MAX = int(os.environ.get("EXECID_CACHE_MAX", "5000"))
 ORDER_AGGREGATION_WINDOW_SEC = int(os.environ.get("ORDER_AGGREGATION_WINDOW_SEC", "8"))
+BYBIT_WS_AUTH_EXPIRE_SEC = max(1, int(os.environ.get("BYBIT_WS_AUTH_EXPIRE_SEC", "10")))
 
 # Logging
 logging.basicConfig(
@@ -412,43 +401,11 @@ def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> str:
             or position_details.get("pnl")
         )
 
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-    rr_ratio = calc_rr(side, entry_price, stop_loss, take_profit)
-=======
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
+
     current_size = to_float(position_details.get("size")) or 0.0
     prev_snapshot = get_prev_position_snapshot(category, symbol)
     prev_size = to_float(prev_snapshot.get("size")) or 0.0
     prev_entry = to_float(prev_snapshot.get("avgPrice"))
-<<<<<<< ours
-<<<<<<< ours
-=======
-
-    reduce_only = str(exec_evt.get("reduceOnly", order_details.get("reduceOnly", ""))).lower() in ("1", "true", "t", "yes")
-    title = resolve_event_title(side, reduce_only, prev_size, current_size)
-=======
-
-    reduce_only = str(exec_evt.get("reduceOnly", order_details.get("reduceOnly", ""))).lower() in ("1", "true", "t", "yes")
-    title = resolve_event_title(side, reduce_only, prev_size, current_size)
-
-    entry_price_for_rr = to_float(avg_fill_price)
-    if title in ("Частичное закрытие", "Закрытие позиции") and prev_entry is not None:
-        entry_price_for_rr = prev_entry
-
-    rr_ratio = calc_rr(side, entry_price_for_rr, stop_loss, take_profit)
->>>>>>> theirs
-
-    entry_price_for_rr = to_float(avg_fill_price)
-    if title in ("Частичное закрытие", "Закрытие позиции") and prev_entry is not None:
-        entry_price_for_rr = prev_entry
-
-    rr_ratio = calc_rr(side, entry_price_for_rr, stop_loss, take_profit)
->>>>>>> theirs
 
     reduce_only = str(exec_evt.get("reduceOnly", order_details.get("reduceOnly", ""))).lower() in ("1", "true", "t", "yes")
     title = resolve_event_title(side, reduce_only, prev_size, current_size)
@@ -459,7 +416,6 @@ def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> str:
 
     rr_ratio = calc_rr(side, entry_price_for_rr, stop_loss, take_profit)
 
->>>>>>> theirs
     rsi = rest.get_rsi_4h(category, symbol, length=14)
     rsi_str = fmt_num(rsi, 2) if rsi is not None else "n/a"
 
@@ -485,14 +441,6 @@ def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> str:
     if exec_count > 1:
         lines.append(f"<b>Количество исполнений:</b> {exec_count}")
 
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
-=======
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
     if title == "Открыта позиция" and stop_loss is not None and take_profit is not None:
         lines.append(f"<b>SL:</b> {fmt_num(stop_loss)}")
         lines.append(f"<b>TP:</b> {fmt_num(take_profit)}")
@@ -508,13 +456,6 @@ def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> str:
         if change_pct is not None:
             lines.append(f"<b>Соотношение (%):</b> {fmt_num(change_pct, 2)}%")
 
-<<<<<<< ours
-<<<<<<< ours
->>>>>>> theirs
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
     if realized_pnl is not None:
         lines.append(f"<b>Реализованный PnL:</b> {fmt_num(realized_pnl)} {pnl_coin}")
     if current_pnl is not None:
@@ -576,9 +517,6 @@ class ExecutionAggregator:
         self._lock = threading.Lock()
         self._execid_seen: Set[str] = set()
         self._pending_orders: Dict[str, AggregatedOrder] = {}
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
 
     @staticmethod
     def _order_key(evt: Dict[str, Any]) -> Optional[str]:
@@ -588,27 +526,6 @@ class ExecutionAggregator:
         return None
 
     @staticmethod
-=======
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
-
-    @staticmethod
-    def _order_key(evt: Dict[str, Any]) -> Optional[str]:
-        order_id = str(evt.get("orderId", evt.get("order_id", "")) or "")
-        if order_id:
-            return f"order:{order_id}"
-        return None
-
-    @staticmethod
-<<<<<<< ours
-<<<<<<< ours
->>>>>>> theirs
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
     def _is_trade(evt: Dict[str, Any]) -> bool:
         exec_type = (evt.get("execType") or evt.get("exec_type") or "").lower()
         return not exec_type or exec_type == "trade"
@@ -737,16 +654,7 @@ class ExecutionAggregator:
 
                 key = self._order_key(evt)
                 if not key:
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
                     # безопасный fallback: если orderId нет, не агрегируем чужие ордера
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
                     ready_events.append(evt)
                     continue
 
@@ -771,31 +679,10 @@ class ExecutionAggregator:
                 if not agg:
                     continue
                 ready_events.append(self._build_event_from_agg(agg))
-<<<<<<< ours
-<<<<<<< ours
-<<<<<<< ours
 
         return ready_events
 
 
-=======
-
-        return ready_events
-
-
->>>>>>> theirs
-=======
-
-        return ready_events
-
-
->>>>>>> theirs
-=======
-
-        return ready_events
-
-
->>>>>>> theirs
 # ==========================
 # WS handler
 # ==========================
@@ -851,6 +738,7 @@ def main() -> None:
         channel_type="private",
         api_key=BYBIT_API_KEY,
         api_secret=BYBIT_API_SECRET,
+        private_auth_expire=BYBIT_WS_AUTH_EXPIRE_SEC,
     )
 
     ws.subscribe(
