@@ -16,7 +16,19 @@ load_dotenv()
 # ==========================
 # Config
 # ==========================
+<<<<<<< ours
+<<<<<<< ours
+<<<<<<< ours
 BOT_VERSION = "1.3"
+=======
+BOT_VERSION = "1.4"
+>>>>>>> theirs
+=======
+BOT_VERSION = "1.4"
+>>>>>>> theirs
+=======
+BOT_VERSION = "1.4"
+>>>>>>> theirs
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "")
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
 BYBIT_TESTNET = os.environ.get("BYBIT_TESTNET", "0") == "1"
@@ -105,6 +117,15 @@ def calc_rr(side: str, entry: Optional[float], sl: Optional[float], tp: Optional
     return reward / risk
 
 
+def calc_change_percent(direction: str, entry: Optional[float], exit_price: Optional[float]) -> Optional[float]:
+    if entry is None or exit_price is None or entry <= 0:
+        return None
+    d = (direction or "").lower()
+    if d in ("sell", "short"):
+        return ((entry - exit_price) / entry) * 100.0
+    return ((exit_price - entry) / entry) * 100.0
+
+
 # ==========================
 # Telegram
 # ==========================
@@ -172,8 +193,14 @@ class BybitRest:
             for k, _ in items[: max(1, len(items) - max_items)]:
                 self._position_cache.pop(k, None)
 
-    def get_order_details(self, category: str, symbol: str, order_id: str,
-                          cache_ttl_sec: int = 3600, cache_max: int = 3000) -> Dict[str, Any]:
+    def get_order_details(
+        self,
+        category: str,
+        symbol: str,
+        order_id: str,
+        cache_ttl_sec: int = 3600,
+        cache_max: int = 3000,
+    ) -> Dict[str, Any]:
         if not order_id:
             return {}
 
@@ -207,8 +234,13 @@ class BybitRest:
         self._cache_put(order_id, {}, cache_max)
         return {}
 
-    def get_position_details(self, category: str, symbol: str,
-                             cache_ttl_sec: int = 15, cache_max: int = 2000) -> Dict[str, Any]:
+    def get_position_details(
+        self,
+        category: str,
+        symbol: str,
+        cache_ttl_sec: int = 15,
+        cache_max: int = 2000,
+    ) -> Dict[str, Any]:
         c = (category or "").lower()
         if not c or not symbol:
             return {}
@@ -280,10 +312,59 @@ class BybitRest:
 
 
 # ==========================
+# Position state snapshot
+# ==========================
+position_state_lock = threading.Lock()
+position_state: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+
+def get_prev_position_snapshot(category: str, symbol: str) -> Dict[str, Any]:
+    with position_state_lock:
+        return dict(position_state.get((category.lower(), symbol), {}))
+
+
+def update_position_snapshot(category: str, symbol: str, details: Dict[str, Any]) -> None:
+    key = (category.lower(), symbol)
+    size = to_float(details.get("size")) or 0.0
+    with position_state_lock:
+        if size <= 0:
+            position_state.pop(key, None)
+            return
+        position_state[key] = {
+            "size": size,
+            "avgPrice": to_float(details.get("avgPrice") or details.get("avgEntryPrice") or details.get("entryPrice")),
+            "side": str(details.get("side", "")).lower(),
+            "updatedAt": time.time(),
+        }
+
+
+# ==========================
 # Message builder
 # ==========================
+def resolve_event_title(
+    side: str,
+    reduce_only: bool,
+    prev_size: float,
+    current_size: float,
+) -> str:
+    if reduce_only:
+        return "Закрытие позиции" if current_size <= 0 else "Частичное закрытие"
+
+    if prev_size <= 0 and current_size > 0:
+        return "Открыта позиция"
+
+    if current_size > prev_size:
+        return "Добавка"
+
+    # fallback for incomplete state
+    side_l = (side or "").lower()
+    if side_l in ("buy", "sell"):
+        return "Открыта позиция"
+    return "Исполнение ордера"
+
+
 def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> str:
-    category = exec_evt.get("category", "") or exec_evt.get("categoryType", "") or ""
+    category = str(exec_evt.get("category", "") or exec_evt.get("categoryType", "") or "")
     market_type = map_market_type(category)
 
     symbol = str(exec_evt.get("symbol", "—"))
@@ -319,19 +400,66 @@ def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> str:
         order_status = order_details.get("orderStatus", "—")
     if realized_pnl is None:
         realized_pnl = to_float(order_details.get("closedPnl") or order_details.get("realizedPnl"))
+
     stop_loss = to_float(order_details.get("stopLoss"))
     take_profit = to_float(order_details.get("takeProfit"))
-    entry_price = to_float(avg_fill_price)
 
-    if current_pnl is None and category:
-        position_details = rest.get_position_details(category, symbol)
+    position_details = rest.get_position_details(category, symbol) if category else {}
+    if current_pnl is None:
         current_pnl = to_float(
             position_details.get("unrealisedPnl")
             or position_details.get("unrealizedPnl")
             or position_details.get("pnl")
         )
 
+<<<<<<< ours
+<<<<<<< ours
+<<<<<<< ours
     rr_ratio = calc_rr(side, entry_price, stop_loss, take_profit)
+=======
+=======
+>>>>>>> theirs
+=======
+>>>>>>> theirs
+    current_size = to_float(position_details.get("size")) or 0.0
+    prev_snapshot = get_prev_position_snapshot(category, symbol)
+    prev_size = to_float(prev_snapshot.get("size")) or 0.0
+    prev_entry = to_float(prev_snapshot.get("avgPrice"))
+<<<<<<< ours
+<<<<<<< ours
+=======
+
+    reduce_only = str(exec_evt.get("reduceOnly", order_details.get("reduceOnly", ""))).lower() in ("1", "true", "t", "yes")
+    title = resolve_event_title(side, reduce_only, prev_size, current_size)
+=======
+
+    reduce_only = str(exec_evt.get("reduceOnly", order_details.get("reduceOnly", ""))).lower() in ("1", "true", "t", "yes")
+    title = resolve_event_title(side, reduce_only, prev_size, current_size)
+
+    entry_price_for_rr = to_float(avg_fill_price)
+    if title in ("Частичное закрытие", "Закрытие позиции") and prev_entry is not None:
+        entry_price_for_rr = prev_entry
+
+    rr_ratio = calc_rr(side, entry_price_for_rr, stop_loss, take_profit)
+>>>>>>> theirs
+
+    entry_price_for_rr = to_float(avg_fill_price)
+    if title in ("Частичное закрытие", "Закрытие позиции") and prev_entry is not None:
+        entry_price_for_rr = prev_entry
+
+    rr_ratio = calc_rr(side, entry_price_for_rr, stop_loss, take_profit)
+>>>>>>> theirs
+
+    reduce_only = str(exec_evt.get("reduceOnly", order_details.get("reduceOnly", ""))).lower() in ("1", "true", "t", "yes")
+    title = resolve_event_title(side, reduce_only, prev_size, current_size)
+
+    entry_price_for_rr = to_float(avg_fill_price)
+    if title in ("Частичное закрытие", "Закрытие позиции") and prev_entry is not None:
+        entry_price_for_rr = prev_entry
+
+    rr_ratio = calc_rr(side, entry_price_for_rr, stop_loss, take_profit)
+
+>>>>>>> theirs
     rsi = rest.get_rsi_4h(category, symbol, length=14)
     rsi_str = fmt_num(rsi, 2) if rsi is not None else "n/a"
 
@@ -339,7 +467,7 @@ def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> str:
     tv_link = rest.make_tv_link(symbol)
 
     lines = [
-        "🔔 <b>Исполнение ордера</b>",
+        f"🔔 <b>{title}</b>",
         "",
         f"<b>Биржа:</b> Bybit",
         f"<b>Тип рынка:</b> {market_type}",
@@ -357,15 +485,47 @@ def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> str:
     if exec_count > 1:
         lines.append(f"<b>Количество исполнений:</b> {exec_count}")
 
+<<<<<<< ours
+<<<<<<< ours
+<<<<<<< ours
+=======
+=======
+>>>>>>> theirs
+=======
+>>>>>>> theirs
+    if title == "Открыта позиция" and stop_loss is not None and take_profit is not None:
+        lines.append(f"<b>SL:</b> {fmt_num(stop_loss)}")
+        lines.append(f"<b>TP:</b> {fmt_num(take_profit)}")
+
+    if title in ("Частичное закрытие", "Закрытие позиции"):
+        exit_price = to_float(avg_fill_price)
+        position_direction = prev_snapshot.get("side") or ("buy" if str(side).lower() == "sell" else "sell")
+        change_pct = calc_change_percent(str(position_direction), prev_entry, exit_price)
+        if prev_entry is not None:
+            lines.append(f"<b>Цена входа:</b> {fmt_num(prev_entry)}")
+        if exit_price is not None:
+            lines.append(f"<b>Цена выхода:</b> {fmt_num(exit_price)}")
+        if change_pct is not None:
+            lines.append(f"<b>Соотношение (%):</b> {fmt_num(change_pct, 2)}%")
+
+<<<<<<< ours
+<<<<<<< ours
+>>>>>>> theirs
+=======
+>>>>>>> theirs
+=======
+>>>>>>> theirs
     if realized_pnl is not None:
         lines.append(f"<b>Реализованный PnL:</b> {fmt_num(realized_pnl)} {pnl_coin}")
     if current_pnl is not None:
         lines.append(f"<b>Текущий PnL:</b> {fmt_num(current_pnl)} {pnl_coin}")
 
-    if stop_loss is not None:
-        lines.append(f"<b>Stop Loss:</b> {fmt_num(stop_loss)}")
-    if take_profit is not None:
-        lines.append(f"<b>Take Profit:</b> {fmt_num(take_profit)}")
+    if title != "Открыта позиция":
+        if stop_loss is not None:
+            lines.append(f"<b>Stop Loss:</b> {fmt_num(stop_loss)}")
+        if take_profit is not None:
+            lines.append(f"<b>Take Profit:</b> {fmt_num(take_profit)}")
+
     if rr_ratio is not None:
         lines.append(f"<b>R:R:</b> {fmt_num(rr_ratio, 2)}")
 
@@ -378,6 +538,8 @@ def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> str:
         "",
         f"🔗 <a href='{bybit_link}'>Bybit</a> | <a href='{tv_link}'>TradingView</a>",
     ]
+
+    update_position_snapshot(category, symbol, position_details)
 
     return "\n".join(lines)
 
@@ -414,6 +576,9 @@ class ExecutionAggregator:
         self._lock = threading.Lock()
         self._execid_seen: Set[str] = set()
         self._pending_orders: Dict[str, AggregatedOrder] = {}
+<<<<<<< ours
+<<<<<<< ours
+<<<<<<< ours
 
     @staticmethod
     def _order_key(evt: Dict[str, Any]) -> Optional[str]:
@@ -423,6 +588,27 @@ class ExecutionAggregator:
         return None
 
     @staticmethod
+=======
+=======
+>>>>>>> theirs
+=======
+>>>>>>> theirs
+
+    @staticmethod
+    def _order_key(evt: Dict[str, Any]) -> Optional[str]:
+        order_id = str(evt.get("orderId", evt.get("order_id", "")) or "")
+        if order_id:
+            return f"order:{order_id}"
+        return None
+
+    @staticmethod
+<<<<<<< ours
+<<<<<<< ours
+>>>>>>> theirs
+=======
+>>>>>>> theirs
+=======
+>>>>>>> theirs
     def _is_trade(evt: Dict[str, Any]) -> bool:
         exec_type = (evt.get("execType") or evt.get("exec_type") or "").lower()
         return not exec_type or exec_type == "trade"
@@ -551,7 +737,16 @@ class ExecutionAggregator:
 
                 key = self._order_key(evt)
                 if not key:
+<<<<<<< ours
+<<<<<<< ours
+<<<<<<< ours
                     # безопасный fallback: если orderId нет, не агрегируем чужие ордера
+=======
+>>>>>>> theirs
+=======
+>>>>>>> theirs
+=======
+>>>>>>> theirs
                     ready_events.append(evt)
                     continue
 
@@ -576,10 +771,31 @@ class ExecutionAggregator:
                 if not agg:
                     continue
                 ready_events.append(self._build_event_from_agg(agg))
+<<<<<<< ours
+<<<<<<< ours
+<<<<<<< ours
 
         return ready_events
 
 
+=======
+
+        return ready_events
+
+
+>>>>>>> theirs
+=======
+
+        return ready_events
+
+
+>>>>>>> theirs
+=======
+
+        return ready_events
+
+
+>>>>>>> theirs
 # ==========================
 # WS handler
 # ==========================
