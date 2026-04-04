@@ -16,7 +16,7 @@ load_dotenv()
 # ==========================
 # Config
 # ==========================
-BOT_VERSION = "1.4"
+BOT_VERSION = "1.5"
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
 BYBIT_TESTNET = os.environ.get("BYBIT_TESTNET", "0") == "1"
@@ -299,6 +299,42 @@ class BybitRest:
     def make_tv_link(symbol: str) -> str:
         return f"https://www.tradingview.com/symbols/{symbol}/"
 
+    def get_all_open_positions(self, category: str = "linear") -> List[Dict[str, Any]]:
+        """Получает все текущие открытые позиции для категории (по умолчанию linear/фьючерсы)"""
+        try:
+            resp = self.http.get_positions(category=category, settleCoin="USDT")
+            lst = (((resp or {}).get("result") or {}).get("list") or [])
+            return [p for p in lst if to_float(p.get("size")) and to_float(p.get("size")) > 0]
+        except Exception as e:
+            log.warning(f"Failed to get open positions: {e}")
+            return []
+
+    def get_ticker_info(self, category: str, symbol: str) -> Dict[str, Any]:
+        """Получает текущую информацию о тикере, включая ставку фандинга"""
+        try:
+            resp = self.http.get_tickers(category=category, symbol=symbol)
+            lst = (((resp or {}).get("result") or {}).get("list") or [])
+            if lst:
+                return lst[0]
+        except Exception as e:
+            log.warning(f"Failed to get ticker info for {symbol}: {e}")
+        return {}
+
+    def get_funding_history_24h(self, category: str, symbol: str) -> float:
+        """Считает суммарный PnL от фандинга за последние 24 часа"""
+        try:
+            start_time = int((time.time() - 24 * 3600) * 1000)
+            resp = self.http.get_execution_list(category=category, symbol=symbol, execType="Funding", startTime=start_time, limit=100)
+            lst = (((resp or {}).get("result") or {}).get("list") or [])
+            total_funding_paid = 0.0
+            for exec_val in lst:
+                fee = to_float(exec_val.get("execFee")) or 0.0
+                total_funding_paid += fee
+            return -total_funding_paid
+        except Exception as e:
+            log.warning(f"Failed to get funding history: {e}")
+            return 0.0
+
 
 # ==========================
 # Position state snapshot
@@ -345,7 +381,6 @@ def resolve_event_title(
     if current_size > prev_size:
         return "Добавка"
 
-    # fallback for incomplete state
     side_l = (side or "").lower()
     if side_l in ("buy", "sell"):
         return "Открыта позиция"
@@ -400,7 +435,6 @@ def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> str:
             or position_details.get("unrealizedPnl")
             or position_details.get("pnl")
         )
-
 
     current_size = to_float(position_details.get("size")) or 0.0
     prev_snapshot = get_prev_position_snapshot(category, symbol)
@@ -484,6 +518,121 @@ def build_message(exec_evt: Dict[str, Any], rest: BybitRest) -> str:
 
     return "\n".join(lines)
 
+
+# ==========================
+# Funding Monitor
+# ==========================
+funding_state = {
+    "next_time": {}, # symbol -> nextFundingTime
+    "anomaly": {}    # symbol -> timestamp последнего алерта аномалии
+}
+
+def send_funding_alert(title: str, symbol: str, side: str, size: float, mark_price: float, funding_rate: float, next_funding_time: int, rest: BybitRest):
+    side_ru = "Long" if side.lower() == "buy" else "Short"
+    rate_pct = funding_rate * 100
+
+    # Кто кому платит
+    if funding_rate > 0:
+        pays_text = "Лонги платят Шортам"
+    elif funding_rate < 0:
+        pays_text = "Шорты платят Лонгам"
+    else:
+        pays_text = "Никто никому не платит (0%)"
+
+    # Прогноз выплаты/получения
+    forecast_value = size * mark_price * abs(funding_rate)
+    will_pay = False
+    if side.lower() == "buy" and funding_rate > 0:
+        will_pay = True
+    elif side.lower() == "sell" and funding_rate < 0:
+        will_pay = True
+
+    action_text = "Выплата" if will_pay else "Получение"
+    sign_text = "-" if will_pay else "+"
+
+    # Таймер до фандинга
+    now_ms = int(time.time() * 1000)
+    time_diff = next_funding_time - now_ms
+    if time_diff < 0: time_diff = 0
+    hours = time_diff // 3600000
+    mins = (time_diff % 3600000) // 60000
+    secs = (time_diff % 60000) // 1000
+    timer_text = f"{hours:02d}:{mins:02d}:{secs:02d}"
+
+    # PnL за 24ч
+    funding_24h_val = rest.get_funding_history_24h("linear", symbol)
+    pnl_24h_str = f"{'+' if funding_24h_val > 0 else ''}{fmt_num(funding_24h_val, 4)} USDT"
+
+    lines = [
+        f"⏱ <b>{title}</b>",
+        "",
+        f"<b>Инструмент:</b> {symbol} ({side_ru})",
+        f"<b>Текущая ставка фандинга:</b> {fmt_num(rate_pct, 4)}%",
+        f"<b>Кто кому платит:</b> {pays_text}",
+        f"<b>Прогноз ({action_text}):</b> {sign_text}{fmt_num(forecast_value, 4)} USDT",
+        f"<b>До фандинга:</b> {timer_text}",
+        f"<b>PnL фандинга (24ч):</b> {pnl_24h_str}",
+    ]
+    tg_send_message("\n".join(lines))
+
+
+def funding_monitor_loop(rest: BybitRest):
+    """Фоновый поток для проверки фандинга каждые 2 минуты (120 секунд)"""
+    while True:
+        try:
+            now = time.time()
+            now_ms = int(now * 1000)
+
+            positions = rest.get_all_open_positions("linear")
+
+            for pos in positions:
+                symbol = pos.get("symbol")
+                side = pos.get("side") # Buy или Sell
+                size = to_float(pos.get("size")) or 0.0
+
+                if not symbol or size <= 0:
+                    continue
+
+                ticker = rest.get_ticker_info("linear", symbol)
+                if not ticker:
+                    continue
+
+                funding_rate = to_float(ticker.get("fundingRate")) or 0.0
+                next_time = int(ticker.get("nextFundingTime") or 0)
+                mark_price = to_float(ticker.get("markPrice")) or 0.0
+
+                if next_time > 0:
+                    funding_state.setdefault("next_time", {})[symbol] = next_time
+
+                target_time = funding_state["next_time"].get(symbol, next_time)
+                time_to_funding_ms = target_time - now_ms
+
+                # 1. Проверка аномалии (например, > 0.1% за период)
+                if abs(funding_rate) >= 0.001: 
+                    last_anomaly = funding_state.get("anomaly", {}).get(symbol, 0)
+                    if now - last_anomaly > 1800: # 1800 секунд = 30 минут
+                        send_funding_alert("🚨 Аномальный фандинг!", symbol, side, size, mark_price, funding_rate, target_time, rest)
+                        funding_state.setdefault("anomaly", {})[symbol] = now
+
+                # 2. Таймер: За 3 минуты до наступления (180 000 мс)
+                if 0 < time_to_funding_ms <= 180_000:
+                    key = f"pre_{symbol}_{target_time}"
+                    if not funding_state.get(key):
+                        send_funding_alert("⏳ Скоро списание фандинга (3 мин)", symbol, side, size, mark_price, funding_rate, target_time, rest)
+                        funding_state[key] = True
+
+                # 3. Таймер: Через 1-5 минут после наступления (чтобы с интервалом в 2 минуты гарантированно поймать)
+                if -300_000 < time_to_funding_ms <= -60_000: 
+                    key = f"post_{symbol}_{target_time}"
+                    if not funding_state.get(key):
+                        send_funding_alert("💸 Фактический отчет по фандингу", symbol, side, size, mark_price, funding_rate, target_time, rest)
+                        funding_state[key] = True
+
+        except Exception as e:
+            log.exception(f"Funding monitor error: {e}")
+
+        # Сон 120 секунд (2 минуты)
+        time.sleep(120)
 
 # ==========================
 # Aggregation
@@ -654,7 +803,6 @@ class ExecutionAggregator:
 
                 key = self._order_key(evt)
                 if not key:
-                    # безопасный fallback: если orderId нет, не агрегируем чужие ордера
                     ready_events.append(evt)
                     continue
 
@@ -732,6 +880,9 @@ def main() -> None:
 
     flush_thread = threading.Thread(target=flush_loop, args=(rest,), daemon=True, name="agg-flush-loop")
     flush_thread.start()
+
+    funding_thread = threading.Thread(target=funding_monitor_loop, args=(rest,), daemon=True, name="funding-monitor-loop")
+    funding_thread.start()
 
     ws = WebSocket(
         testnet=BYBIT_TESTNET,
