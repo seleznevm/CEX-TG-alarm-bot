@@ -16,7 +16,7 @@ load_dotenv()
 # ==========================
 # Config
 # ==========================
-BOT_VERSION = "1.5"
+BOT_VERSION = "1.6"
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
 BYBIT_TESTNET = os.environ.get("BYBIT_TESTNET", "0") == "1"
@@ -29,6 +29,13 @@ UTC_OFFSET_HOURS = int(os.environ.get("UTC_OFFSET_HOURS", "7"))
 EXECID_CACHE_MAX = int(os.environ.get("EXECID_CACHE_MAX", "5000"))
 ORDER_AGGREGATION_WINDOW_SEC = int(os.environ.get("ORDER_AGGREGATION_WINDOW_SEC", "8"))
 BYBIT_WS_AUTH_EXPIRE_SEC = max(1, int(os.environ.get("BYBIT_WS_AUTH_EXPIRE_SEC", "10")))
+LIMIT_ORDER_ALERT_INTERVAL_SEC = max(60, int(os.environ.get("LIMIT_ORDER_ALERT_INTERVAL_SEC", "300")))
+LIMIT_ORDER_ALERT_DISTANCE_PCT = max(0.1, float(os.environ.get("LIMIT_ORDER_ALERT_DISTANCE_PCT", "5")))
+LIMIT_ORDER_ALERT_CATEGORIES = [
+    item.strip().lower()
+    for item in os.environ.get("LIMIT_ORDER_ALERT_CATEGORIES", "linear").split(",")
+    if item.strip()
+]
 
 # Logging
 logging.basicConfig(
@@ -147,6 +154,7 @@ class BybitRest:
         )
         self._order_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self._position_cache: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
+        self._rsi_cache: Dict[Tuple[str, str, str, int], Tuple[float, Optional[float]]] = {}
 
     def _cache_get(self, order_id: str, ttl_sec: int) -> Optional[Dict[str, Any]]:
         item = self._order_cache.get(order_id)
@@ -251,12 +259,25 @@ class BybitRest:
         self._position_cache_put(key, {}, cache_max)
         return {}
 
-    def get_rsi_4h(self, category: str, symbol: str, length: int = 14) -> Optional[float]:
+    def get_rsi(
+        self,
+        category: str,
+        symbol: str,
+        interval: str,
+        length: int = 14,
+        cache_ttl_sec: int = 300,
+    ) -> Optional[float]:
         c = (category or "").lower()
-        if not c:
+        if not c or not symbol:
             return None
+
+        cache_key = (c, symbol, str(interval), length)
+        cached = self._rsi_cache.get(cache_key)
+        if cached and (time.time() - cached[0]) <= cache_ttl_sec:
+            return cached[1]
+
         try:
-            resp = self.http.get_kline(category=c, symbol=symbol, interval="240", limit=200)
+            resp = self.http.get_kline(category=c, symbol=symbol, interval=str(interval), limit=200)
             rows = (((resp or {}).get("result") or {}).get("list") or [])
             if not rows or len(rows) < (length + 2):
                 return None
@@ -267,9 +288,9 @@ class BybitRest:
             gains = []
             losses = []
             for i in range(1, len(closes)):
-                d = closes[i] - closes[i - 1]
-                gains.append(max(d, 0.0))
-                losses.append(max(-d, 0.0))
+                delta = closes[i] - closes[i - 1]
+                gains.append(max(delta, 0.0))
+                losses.append(max(-delta, 0.0))
 
             avg_gain = sum(gains[:length]) / length
             avg_loss = sum(losses[:length]) / length
@@ -279,12 +300,22 @@ class BybitRest:
                 avg_loss = (avg_loss * (length - 1) + losses[i]) / length
 
             if avg_loss == 0:
-                return 100.0
-            rs = avg_gain / avg_loss
-            return 100.0 - (100.0 / (1.0 + rs))
+                result = 100.0
+            else:
+                rs = avg_gain / avg_loss
+                result = 100.0 - (100.0 / (1.0 + rs))
+
+            self._rsi_cache[cache_key] = (time.time(), result)
+            return result
         except Exception as e:
             log.warning(f"RSI calc failed: {e}")
             return None
+
+    def get_rsi_4h(self, category: str, symbol: str, length: int = 14) -> Optional[float]:
+        return self.get_rsi(category=category, symbol=symbol, interval="240", length=length)
+
+    def get_rsi_1h(self, category: str, symbol: str, length: int = 14) -> Optional[float]:
+        return self.get_rsi(category=category, symbol=symbol, interval="60", length=length)
 
     def make_bybit_link(self, category: str, symbol: str) -> str:
         c = (category or "").lower()
@@ -319,6 +350,58 @@ class BybitRest:
         except Exception as e:
             log.warning(f"Failed to get ticker info for {symbol}: {e}")
         return {}
+
+    def get_all_open_limit_orders(self, categories: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        orders: List[Dict[str, Any]] = []
+        for category in categories or ["linear"]:
+            cursor = ""
+            for _ in range(20):
+                query: Dict[str, Any] = {"category": category, "limit": 50}
+                if cursor:
+                    query["cursor"] = cursor
+
+                try:
+                    resp = self.http.get_open_orders(**query)
+                except Exception as e:
+                    log.warning(f"Failed to get open orders for {category}: {e}")
+                    break
+
+                result = (resp or {}).get("result") or {}
+                page = result.get("list") or []
+                for item in page:
+                    order_type = str(item.get("orderType") or "").lower()
+                    status = str(item.get("orderStatus") or "").lower()
+                    leaves_qty = to_float(item.get("leavesQty"))
+                    qty = to_float(item.get("qty") or item.get("orderQty"))
+
+                    if order_type != "limit":
+                        continue
+                    if status in {"filled", "cancelled", "rejected", "deactivated", "partiallyfilledcanceled"}:
+                        continue
+                    if leaves_qty is None:
+                        leaves_qty = qty or 0.0
+                    if leaves_qty <= 0:
+                        continue
+
+                    enriched = dict(item)
+                    enriched["category"] = str(item.get("category") or category)
+                    orders.append(enriched)
+
+                cursor = str(result.get("nextPageCursor") or "").strip()
+                if not cursor or not page:
+                    break
+
+        return orders
+
+    def get_current_price(self, category: str, symbol: str) -> Optional[float]:
+        ticker = self.get_ticker_info(category, symbol)
+        return (
+            to_float(ticker.get("lastPrice"))
+            or to_float(ticker.get("markPrice"))
+            or to_float(ticker.get("indexPrice"))
+            or to_float(ticker.get("bid1Price"))
+            or to_float(ticker.get("ask1Price"))
+        )
 
     def get_funding_history_24h(self, category: str, symbol: str) -> float:
         """Считает суммарный PnL от фандинга за последние 24 часа"""
@@ -634,6 +717,147 @@ def funding_monitor_loop(rest: BybitRest):
         # Сон 120 секунд (2 минуты)
         time.sleep(120)
 
+
+# ==========================
+# Limit Order Monitor
+# ==========================
+limit_order_alert_state_lock = threading.Lock()
+limit_order_alert_state: Dict[str, Tuple[str, str, str, str]] = {}
+
+
+def map_side_to_direction(side: str) -> str:
+    return "Long" if str(side).lower() == "buy" else "Short"
+
+
+def calc_limit_distance_percent(limit_price: Optional[float], current_price: Optional[float]) -> Optional[float]:
+    if limit_price is None or current_price is None or limit_price <= 0:
+        return None
+    return abs(current_price - limit_price) / limit_price * 100.0
+
+
+def build_limit_order_alert_message(
+    order: Dict[str, Any],
+    current_price: float,
+    distance_pct: float,
+    rsi_1h: Optional[float],
+    rest: BybitRest,
+) -> str:
+    category = str(order.get("category") or "")
+    symbol = str(order.get("symbol") or "n/a")
+    side = str(order.get("side") or "")
+    market_type = map_market_type(category)
+    direction = map_side_to_direction(side)
+
+    limit_price = to_float(order.get("price") or order.get("orderPrice"))
+    qty = to_float(order.get("leavesQty"))
+    if qty is None:
+        qty = to_float(order.get("qty") or order.get("orderQty")) or 0.0
+    notional_usdt = (limit_price or 0.0) * qty
+    rsi_str = fmt_num(rsi_1h, 2) if rsi_1h is not None else "n/a"
+
+    bybit_link = rest.make_bybit_link(category, symbol)
+    tv_link = rest.make_tv_link(symbol)
+
+    return "\n".join([
+        "🎯 <b>Лимитная заявка рядом с рынком</b>",
+        "",
+        "<b>Биржа:</b> Bybit",
+        f"<b>Рынок:</b> {market_type}",
+        f"<b>Тикер:</b> {symbol}",
+        f"<b>Направление:</b> {direction}",
+        f"<b>Цена лимитки:</b> {fmt_num(limit_price)}",
+        f"<b>Текущая цена:</b> {fmt_num(current_price)}",
+        f"<b>Остаток лотов:</b> {fmt_num(qty)}",
+        f"<b>Остаток в USDT:</b> {fmt_num(notional_usdt, 2)} USDT",
+        f"<b>До лимитки:</b> {fmt_num(distance_pct, 2)}%",
+        f"<b>RSI (1H):</b> {rsi_str}",
+        "",
+        f"🔗 <a href='{bybit_link}'>Bybit</a> | <a href='{tv_link}'>TradingView</a>",
+    ])
+
+
+def should_send_limit_order_alert(order: Dict[str, Any], signature: Tuple[str, str, str, str]) -> bool:
+    order_id = str(order.get("orderId") or "")
+    if not order_id:
+        return False
+    with limit_order_alert_state_lock:
+        previous_signature = limit_order_alert_state.get(order_id)
+        if previous_signature == signature:
+            return False
+        limit_order_alert_state[order_id] = signature
+        return True
+
+
+def cleanup_limit_order_alert_state(active_order_ids: Set[str]) -> None:
+    with limit_order_alert_state_lock:
+        stale_ids = [order_id for order_id in limit_order_alert_state if order_id not in active_order_ids]
+        for order_id in stale_ids:
+            limit_order_alert_state.pop(order_id, None)
+
+
+def limit_order_monitor_loop(rest: BybitRest) -> None:
+    while True:
+        active_order_ids: Set[str] = set()
+        try:
+            orders = rest.get_all_open_limit_orders(LIMIT_ORDER_ALERT_CATEGORIES)
+            price_cache: Dict[Tuple[str, str], Optional[float]] = {}
+            rsi_cache: Dict[Tuple[str, str], Optional[float]] = {}
+
+            for order in orders:
+                order_id = str(order.get("orderId") or "")
+                if not order_id:
+                    continue
+                active_order_ids.add(order_id)
+
+                category = str(order.get("category") or "").lower()
+                symbol = str(order.get("symbol") or "")
+                limit_price = to_float(order.get("price") or order.get("orderPrice"))
+                if not category or not symbol or limit_price is None or limit_price <= 0:
+                    continue
+
+                cache_key = (category, symbol)
+                if cache_key not in price_cache:
+                    price_cache[cache_key] = rest.get_current_price(category, symbol)
+                current_price = price_cache[cache_key]
+                distance_pct = calc_limit_distance_percent(limit_price, current_price)
+                if current_price is None or distance_pct is None:
+                    continue
+
+                if distance_pct > LIMIT_ORDER_ALERT_DISTANCE_PCT:
+                    with limit_order_alert_state_lock:
+                        limit_order_alert_state.pop(order_id, None)
+                    continue
+
+                if cache_key not in rsi_cache:
+                    rsi_cache[cache_key] = rest.get_rsi_1h(category, symbol, length=14)
+                rsi_1h = rsi_cache[cache_key]
+
+                qty = to_float(order.get("leavesQty"))
+                if qty is None:
+                    qty = to_float(order.get("qty") or order.get("orderQty")) or 0.0
+
+                signature = (
+                    fmt_num(limit_price, 8),
+                    fmt_num(qty, 8),
+                    str(order.get("side") or ""),
+                    str(order.get("updatedTime") or order.get("createdTime") or ""),
+                )
+                if not should_send_limit_order_alert(order, signature):
+                    continue
+
+                tg_send_message(build_limit_order_alert_message(order, current_price, distance_pct, rsi_1h, rest))
+                log.info(
+                    "Sent limit order alert orderId=%s symbol=%s distancePct=%s",
+                    order_id,
+                    symbol,
+                    fmt_num(distance_pct, 2),
+                )
+        except Exception as e:
+            log.exception(f"Limit order monitor error: {e}")
+        finally:
+            cleanup_limit_order_alert_state(active_order_ids)
+            time.sleep(LIMIT_ORDER_ALERT_INTERVAL_SEC)
+
 # ==========================
 # Aggregation
 # ==========================
@@ -883,6 +1107,9 @@ def main() -> None:
 
     funding_thread = threading.Thread(target=funding_monitor_loop, args=(rest,), daemon=True, name="funding-monitor-loop")
     funding_thread.start()
+
+    limit_order_thread = threading.Thread(target=limit_order_monitor_loop, args=(rest,), daemon=True, name="limit-order-monitor-loop")
+    limit_order_thread.start()
 
     ws = WebSocket(
         testnet=BYBIT_TESTNET,
