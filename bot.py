@@ -4,6 +4,7 @@ import math
 import datetime as dt
 import logging
 import threading
+import concurrent.futures as cf
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Set
 
@@ -37,6 +38,7 @@ LIMIT_ORDER_ALERT_CATEGORIES = [
     if item.strip()
 ]
 POSITION_FUNDING_LOOKBACK_DAYS = max(7, int(os.environ.get("POSITION_FUNDING_LOOKBACK_DAYS", "30")))
+FUNDING_LOOKUP_TIMEOUT_SEC = max(1, int(os.environ.get("FUNDING_LOOKUP_TIMEOUT_SEC", "3")))
 
 # Logging
 logging.basicConfig(
@@ -686,6 +688,49 @@ funding_state = {
     "anomaly": {}    # symbol -> timestamp последнего алерта аномалии
 }
 
+
+def resolve_funding_total_text(
+    rest: BybitRest,
+    symbol: str,
+    side: str,
+    position_created_time: str,
+) -> str:
+    executor = cf.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(
+        rest.get_position_funding_total,
+        "linear",
+        symbol,
+        side,
+        position_created_time,
+    )
+    try:
+        funding_total = future.result(timeout=FUNDING_LOOKUP_TIMEOUT_SEC)
+    except cf.TimeoutError:
+        future.cancel()
+        log.warning(
+            "Funding total lookup timed out for symbol=%s side=%s after %ss",
+            symbol,
+            side,
+            FUNDING_LOOKUP_TIMEOUT_SEC,
+        )
+        return "n/a"
+    except Exception as e:
+        log.warning("Funding total lookup failed for symbol=%s side=%s: %s", symbol, side, e)
+        return "n/a"
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    if funding_total is None:
+        return "n/a"
+
+    funding_value = to_float(funding_total.get("funding")) or 0.0
+    funding_currency = str(funding_total.get("currency") or "USDT")
+    funding_direction = "получено" if funding_value > 0 else "выплачено" if funding_value < 0 else "0"
+    funding_total_str = f"{'+' if funding_value > 0 else ''}{fmt_num(funding_value, 4)} {funding_currency}"
+    if funding_direction != "0":
+        funding_total_str = f"{funding_total_str} ({funding_direction})"
+    return funding_total_str
+
 def send_funding_alert(
     title: str,
     symbol: str,
@@ -728,16 +773,7 @@ def send_funding_alert(
     secs = (time_diff % 60000) // 1000
     timer_text = f"{hours:02d}:{mins:02d}:{secs:02d}"
 
-    funding_total = rest.get_position_funding_total("linear", symbol, side, position_created_time)
-    if funding_total is not None:
-        funding_value = to_float(funding_total.get("funding")) or 0.0
-        funding_currency = str(funding_total.get("currency") or "USDT")
-        funding_direction = "получено" if funding_value > 0 else "выплачено" if funding_value < 0 else "0"
-        funding_total_str = f"{'+' if funding_value > 0 else ''}{fmt_num(funding_value, 4)} {funding_currency}"
-        if funding_direction != "0":
-            funding_total_str = f"{funding_total_str} ({funding_direction})"
-    else:
-        funding_total_str = "n/a"
+    funding_total_str = resolve_funding_total_text(rest, symbol, side, position_created_time)
 
     lines = [
         f"⏱ <b>{title}</b>",
