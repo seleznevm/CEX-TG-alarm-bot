@@ -155,6 +155,7 @@ class BybitRest:
         self._order_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self._position_cache: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
         self._rsi_cache: Dict[Tuple[str, str, str, int], Tuple[float, Optional[float]]] = {}
+        self._funding_cache: Dict[Tuple[str, str, str], Tuple[float, Optional[Dict[str, Any]]]] = {}
 
     def _cache_get(self, order_id: str, ttl_sec: int) -> Optional[Dict[str, Any]]:
         item = self._order_cache.get(order_id)
@@ -403,20 +404,69 @@ class BybitRest:
             or to_float(ticker.get("ask1Price"))
         )
 
-    def get_funding_history_24h(self, category: str, symbol: str) -> float:
-        """Считает суммарный PnL от фандинга за последние 24 часа"""
+    def get_latest_position_funding(
+        self,
+        category: str,
+        symbol: str,
+        side: str,
+        cache_ttl_sec: int = 60,
+    ) -> Optional[Dict[str, Any]]:
+        cache_key = ((category or "").lower(), symbol, (side or "").lower())
+        cached = self._funding_cache.get(cache_key)
+        if cached and (time.time() - cached[0]) <= cache_ttl_sec:
+            return cached[1]
+
+        c = (category or "").lower()
+        if not c or not symbol:
+            return None
+
+        cursor = ""
+        found: Optional[Dict[str, Any]] = None
+
         try:
-            start_time = int((time.time() - 24 * 3600) * 1000)
-            resp = self.http.get_execution_list(category=category, symbol=symbol, execType="Funding", startTime=start_time, limit=100)
-            lst = (((resp or {}).get("result") or {}).get("list") or [])
-            total_funding_paid = 0.0
-            for exec_val in lst:
-                fee = to_float(exec_val.get("execFee")) or 0.0
-                total_funding_paid += fee
-            return -total_funding_paid
+            for _ in range(5):
+                query: Dict[str, Any] = {
+                    "accountType": "UNIFIED",
+                    "category": c,
+                    "type": "SETTLEMENT",
+                    "limit": 50,
+                }
+                if cursor:
+                    query["cursor"] = cursor
+
+                resp = self.http.get_transaction_log(**query)
+                result = (resp or {}).get("result") or {}
+                rows = result.get("list") or []
+
+                for item in rows:
+                    if str(item.get("symbol") or "") != symbol:
+                        continue
+                    item_side = str(item.get("side") or "").lower()
+                    if side and item_side and item_side != str(side).lower():
+                        continue
+
+                    funding = to_float(item.get("funding"))
+                    if funding is None:
+                        continue
+
+                    found = {
+                        "funding": funding,
+                        "transactionTime": int(item.get("transactionTime") or 0),
+                        "currency": str(item.get("currency") or "USDT"),
+                    }
+                    break
+
+                if found is not None:
+                    break
+
+                cursor = str(result.get("nextPageCursor") or "").strip()
+                if not cursor or not rows:
+                    break
         except Exception as e:
-            log.warning(f"Failed to get funding history: {e}")
-            return 0.0
+            log.warning(f"Failed to get latest funding for {symbol}: {e}")
+
+        self._funding_cache[cache_key] = (time.time(), found)
+        return found
 
 
 # ==========================
@@ -642,9 +692,16 @@ def send_funding_alert(title: str, symbol: str, side: str, size: float, mark_pri
     secs = (time_diff % 60000) // 1000
     timer_text = f"{hours:02d}:{mins:02d}:{secs:02d}"
 
-    # PnL за 24ч
-    funding_24h_val = rest.get_funding_history_24h("linear", symbol)
-    pnl_24h_str = f"{'+' if funding_24h_val > 0 else ''}{fmt_num(funding_24h_val, 4)} USDT"
+    latest_funding = rest.get_latest_position_funding("linear", symbol, side)
+    if latest_funding is not None:
+        funding_value = to_float(latest_funding.get("funding")) or 0.0
+        funding_currency = str(latest_funding.get("currency") or "USDT")
+        funding_direction = "получено" if funding_value > 0 else "выплачено" if funding_value < 0 else "0"
+        latest_funding_str = f"{'+' if funding_value > 0 else ''}{fmt_num(funding_value, 4)} {funding_currency}"
+        if funding_direction != "0":
+            latest_funding_str = f"{latest_funding_str} ({funding_direction})"
+    else:
+        latest_funding_str = "n/a"
 
     lines = [
         f"⏱ <b>{title}</b>",
@@ -654,7 +711,7 @@ def send_funding_alert(title: str, symbol: str, side: str, size: float, mark_pri
         f"<b>Кто кому платит:</b> {pays_text}",
         f"<b>Прогноз ({action_text}):</b> {sign_text}{fmt_num(forecast_value, 4)} USDT",
         f"<b>До фандинга:</b> {timer_text}",
-        f"<b>PnL фандинга (24ч):</b> {pnl_24h_str}",
+        f"<b>Последний funding по позиции:</b> {latest_funding_str}",
     ]
     tg_send_message("\n".join(lines))
 
