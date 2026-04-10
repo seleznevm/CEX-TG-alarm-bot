@@ -156,7 +156,7 @@ class BybitRest:
         self._order_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self._position_cache: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
         self._rsi_cache: Dict[Tuple[str, str, str, int], Tuple[float, Optional[float]]] = {}
-        self._funding_cache: Dict[Tuple[str, str, str, str, str], Tuple[float, Optional[Dict[str, Any]]]] = {}
+        self._funding_cache: Dict[Tuple[str, str, str, str], Tuple[float, Optional[Dict[str, Any]]]] = {}
 
     def _cache_get(self, order_id: str, ttl_sec: int) -> Optional[Dict[str, Any]]:
         item = self._order_cache.get(order_id)
@@ -410,16 +410,14 @@ class BybitRest:
         category: str,
         symbol: str,
         side: str,
-        position_size: float,
-        position_updated_time: str = "",
+        position_created_time: str = "",
         cache_ttl_sec: int = 60,
     ) -> Optional[Dict[str, Any]]:
         cache_key = (
             (category or "").lower(),
             symbol,
             (side or "").lower(),
-            fmt_num(position_size, 8),
-            str(position_updated_time or ""),
+            str(position_created_time or ""),
         )
         cached = self._funding_cache.get(cache_key)
         if cached and (time.time() - cached[0]) <= cache_ttl_sec:
@@ -429,11 +427,9 @@ class BybitRest:
         if not c or not symbol:
             return None
 
-        target_sign = 1 if str(side).lower() == "buy" else -1
         total_funding = 0.0
         funding_currency = "USDT"
         funding_records = 0
-        cycle_found = False
         now_ms = int(time.time() * 1000)
         window_ms = 7 * 24 * 3600 * 1000
         max_lookback_ms = POSITION_FUNDING_LOOKBACK_DAYS * 24 * 3600 * 1000
@@ -441,7 +437,8 @@ class BybitRest:
 
         try:
             end_time = now_ms
-            min_start_time = now_ms - max_lookback_ms
+            created_time_ms = int(position_created_time or 0)
+            min_start_time = max(created_time_ms, now_ms - max_lookback_ms)
 
             while end_time > min_start_time:
                 start_time = max(min_start_time, end_time - window_ms)
@@ -451,6 +448,7 @@ class BybitRest:
                     query: Dict[str, Any] = {
                         "accountType": "UNIFIED",
                         "category": c,
+                        "type": "SETTLEMENT",
                         "startTime": start_time,
                         "endTime": end_time,
                         "limit": 50,
@@ -466,29 +464,8 @@ class BybitRest:
                         if str(item.get("symbol") or "") != symbol:
                             continue
 
-                        size_after = to_float(item.get("size"))
-                        if size_after is None:
-                            continue
-
-                        size_sign = 0
-                        if size_after > 0:
-                            size_sign = 1
-                        elif size_after < 0:
-                            size_sign = -1
-
-                        if size_sign not in (0, target_sign):
-                            cycle_found = True
-                            break
-
-                        if size_sign == 0:
-                            cycle_found = True
-                            break
-
                         item_side = str(item.get("side") or "").lower()
                         if item_side and item_side != str(side).lower():
-                            continue
-
-                        if str(item.get("type") or "").upper() != "SETTLEMENT":
                             continue
 
                         funding = to_float(item.get("funding"))
@@ -499,15 +476,9 @@ class BybitRest:
                         funding_currency = str(item.get("currency") or funding_currency or "USDT")
                         funding_records += 1
 
-                    if cycle_found:
-                        break
-
                     cursor = str(result.get("nextPageCursor") or "").strip()
                     if not cursor or not rows:
                         break
-
-                if cycle_found:
-                    break
 
                 end_time = start_time - 1
         except Exception as e:
@@ -724,7 +695,7 @@ def send_funding_alert(
     funding_rate: float,
     next_funding_time: int,
     rest: BybitRest,
-    position_updated_time: str = "",
+    position_created_time: str = "",
 ):
     side_ru = "Long" if side.lower() == "buy" else "Short"
     rate_pct = funding_rate * 100
@@ -757,7 +728,7 @@ def send_funding_alert(
     secs = (time_diff % 60000) // 1000
     timer_text = f"{hours:02d}:{mins:02d}:{secs:02d}"
 
-    funding_total = rest.get_position_funding_total("linear", symbol, side, size, position_updated_time)
+    funding_total = rest.get_position_funding_total("linear", symbol, side, position_created_time)
     if funding_total is not None:
         funding_value = to_float(funding_total.get("funding")) or 0.0
         funding_currency = str(funding_total.get("currency") or "USDT")
@@ -825,7 +796,7 @@ def funding_monitor_loop(rest: BybitRest):
                             funding_rate,
                             target_time,
                             rest,
-                            position_updated_time=str(pos.get("updatedTime") or ""),
+                            position_created_time=str(pos.get("createdTime") or pos.get("updatedTime") or ""),
                         )
                         funding_state.setdefault("anomaly", {})[symbol] = now
 
@@ -842,7 +813,7 @@ def funding_monitor_loop(rest: BybitRest):
                             funding_rate,
                             target_time,
                             rest,
-                            position_updated_time=str(pos.get("updatedTime") or ""),
+                            position_created_time=str(pos.get("createdTime") or pos.get("updatedTime") or ""),
                         )
                         funding_state[key] = True
 
@@ -859,7 +830,7 @@ def funding_monitor_loop(rest: BybitRest):
                             funding_rate,
                             target_time,
                             rest,
-                            position_updated_time=str(pos.get("updatedTime") or ""),
+                            position_created_time=str(pos.get("createdTime") or pos.get("updatedTime") or ""),
                         )
                         funding_state[key] = True
 
