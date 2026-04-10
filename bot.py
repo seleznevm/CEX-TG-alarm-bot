@@ -36,6 +36,7 @@ LIMIT_ORDER_ALERT_CATEGORIES = [
     for item in os.environ.get("LIMIT_ORDER_ALERT_CATEGORIES", "linear").split(",")
     if item.strip()
 ]
+POSITION_FUNDING_LOOKBACK_DAYS = max(7, int(os.environ.get("POSITION_FUNDING_LOOKBACK_DAYS", "30")))
 
 # Logging
 logging.basicConfig(
@@ -155,7 +156,7 @@ class BybitRest:
         self._order_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self._position_cache: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
         self._rsi_cache: Dict[Tuple[str, str, str, int], Tuple[float, Optional[float]]] = {}
-        self._funding_cache: Dict[Tuple[str, str, str], Tuple[float, Optional[Dict[str, Any]]]] = {}
+        self._funding_cache: Dict[Tuple[str, str, str, str, str], Tuple[float, Optional[Dict[str, Any]]]] = {}
 
     def _cache_get(self, order_id: str, ttl_sec: int) -> Optional[Dict[str, Any]]:
         item = self._order_cache.get(order_id)
@@ -404,14 +405,22 @@ class BybitRest:
             or to_float(ticker.get("ask1Price"))
         )
 
-    def get_latest_position_funding(
+    def get_position_funding_total(
         self,
         category: str,
         symbol: str,
         side: str,
+        position_size: float,
+        position_updated_time: str = "",
         cache_ttl_sec: int = 60,
     ) -> Optional[Dict[str, Any]]:
-        cache_key = ((category or "").lower(), symbol, (side or "").lower())
+        cache_key = (
+            (category or "").lower(),
+            symbol,
+            (side or "").lower(),
+            fmt_num(position_size, 8),
+            str(position_updated_time or ""),
+        )
         cached = self._funding_cache.get(cache_key)
         if cached and (time.time() - cached[0]) <= cache_ttl_sec:
             return cached[1]
@@ -420,50 +429,96 @@ class BybitRest:
         if not c or not symbol:
             return None
 
-        cursor = ""
+        target_sign = 1 if str(side).lower() == "buy" else -1
+        total_funding = 0.0
+        funding_currency = "USDT"
+        funding_records = 0
+        cycle_found = False
+        now_ms = int(time.time() * 1000)
+        window_ms = 7 * 24 * 3600 * 1000
+        max_lookback_ms = POSITION_FUNDING_LOOKBACK_DAYS * 24 * 3600 * 1000
         found: Optional[Dict[str, Any]] = None
 
         try:
-            for _ in range(5):
-                query: Dict[str, Any] = {
-                    "accountType": "UNIFIED",
-                    "category": c,
-                    "type": "SETTLEMENT",
-                    "limit": 50,
-                }
-                if cursor:
-                    query["cursor"] = cursor
+            end_time = now_ms
+            min_start_time = now_ms - max_lookback_ms
 
-                resp = self.http.get_transaction_log(**query)
-                result = (resp or {}).get("result") or {}
-                rows = result.get("list") or []
+            while end_time > min_start_time:
+                start_time = max(min_start_time, end_time - window_ms)
+                cursor = ""
 
-                for item in rows:
-                    if str(item.get("symbol") or "") != symbol:
-                        continue
-                    item_side = str(item.get("side") or "").lower()
-                    if side and item_side and item_side != str(side).lower():
-                        continue
-
-                    funding = to_float(item.get("funding"))
-                    if funding is None:
-                        continue
-
-                    found = {
-                        "funding": funding,
-                        "transactionTime": int(item.get("transactionTime") or 0),
-                        "currency": str(item.get("currency") or "USDT"),
+                while True:
+                    query: Dict[str, Any] = {
+                        "accountType": "UNIFIED",
+                        "category": c,
+                        "startTime": start_time,
+                        "endTime": end_time,
+                        "limit": 50,
                     }
+                    if cursor:
+                        query["cursor"] = cursor
+
+                    resp = self.http.get_transaction_log(**query)
+                    result = (resp or {}).get("result") or {}
+                    rows = result.get("list") or []
+
+                    for item in rows:
+                        if str(item.get("symbol") or "") != symbol:
+                            continue
+
+                        size_after = to_float(item.get("size"))
+                        if size_after is None:
+                            continue
+
+                        size_sign = 0
+                        if size_after > 0:
+                            size_sign = 1
+                        elif size_after < 0:
+                            size_sign = -1
+
+                        if size_sign not in (0, target_sign):
+                            cycle_found = True
+                            break
+
+                        if size_sign == 0:
+                            cycle_found = True
+                            break
+
+                        item_side = str(item.get("side") or "").lower()
+                        if item_side and item_side != str(side).lower():
+                            continue
+
+                        if str(item.get("type") or "").upper() != "SETTLEMENT":
+                            continue
+
+                        funding = to_float(item.get("funding"))
+                        if funding is None:
+                            continue
+
+                        total_funding += funding
+                        funding_currency = str(item.get("currency") or funding_currency or "USDT")
+                        funding_records += 1
+
+                    if cycle_found:
+                        break
+
+                    cursor = str(result.get("nextPageCursor") or "").strip()
+                    if not cursor or not rows:
+                        break
+
+                if cycle_found:
                     break
 
-                if found is not None:
-                    break
-
-                cursor = str(result.get("nextPageCursor") or "").strip()
-                if not cursor or not rows:
-                    break
+                end_time = start_time - 1
         except Exception as e:
-            log.warning(f"Failed to get latest funding for {symbol}: {e}")
+            log.warning(f"Failed to get cumulative funding for {symbol}: {e}")
+
+        if funding_records > 0:
+            found = {
+                "funding": total_funding,
+                "currency": funding_currency,
+                "records": funding_records,
+            }
 
         self._funding_cache[cache_key] = (time.time(), found)
         return found
@@ -660,7 +715,17 @@ funding_state = {
     "anomaly": {}    # symbol -> timestamp последнего алерта аномалии
 }
 
-def send_funding_alert(title: str, symbol: str, side: str, size: float, mark_price: float, funding_rate: float, next_funding_time: int, rest: BybitRest):
+def send_funding_alert(
+    title: str,
+    symbol: str,
+    side: str,
+    size: float,
+    mark_price: float,
+    funding_rate: float,
+    next_funding_time: int,
+    rest: BybitRest,
+    position_updated_time: str = "",
+):
     side_ru = "Long" if side.lower() == "buy" else "Short"
     rate_pct = funding_rate * 100
 
@@ -692,16 +757,16 @@ def send_funding_alert(title: str, symbol: str, side: str, size: float, mark_pri
     secs = (time_diff % 60000) // 1000
     timer_text = f"{hours:02d}:{mins:02d}:{secs:02d}"
 
-    latest_funding = rest.get_latest_position_funding("linear", symbol, side)
-    if latest_funding is not None:
-        funding_value = to_float(latest_funding.get("funding")) or 0.0
-        funding_currency = str(latest_funding.get("currency") or "USDT")
+    funding_total = rest.get_position_funding_total("linear", symbol, side, size, position_updated_time)
+    if funding_total is not None:
+        funding_value = to_float(funding_total.get("funding")) or 0.0
+        funding_currency = str(funding_total.get("currency") or "USDT")
         funding_direction = "получено" if funding_value > 0 else "выплачено" if funding_value < 0 else "0"
-        latest_funding_str = f"{'+' if funding_value > 0 else ''}{fmt_num(funding_value, 4)} {funding_currency}"
+        funding_total_str = f"{'+' if funding_value > 0 else ''}{fmt_num(funding_value, 4)} {funding_currency}"
         if funding_direction != "0":
-            latest_funding_str = f"{latest_funding_str} ({funding_direction})"
+            funding_total_str = f"{funding_total_str} ({funding_direction})"
     else:
-        latest_funding_str = "n/a"
+        funding_total_str = "n/a"
 
     lines = [
         f"⏱ <b>{title}</b>",
@@ -711,7 +776,7 @@ def send_funding_alert(title: str, symbol: str, side: str, size: float, mark_pri
         f"<b>Кто кому платит:</b> {pays_text}",
         f"<b>Прогноз ({action_text}):</b> {sign_text}{fmt_num(forecast_value, 4)} USDT",
         f"<b>До фандинга:</b> {timer_text}",
-        f"<b>Последний funding по позиции:</b> {latest_funding_str}",
+        f"<b>Суммарный funding по позиции:</b> {funding_total_str}",
     ]
     tg_send_message("\n".join(lines))
 
@@ -751,21 +816,51 @@ def funding_monitor_loop(rest: BybitRest):
                 if abs(funding_rate) >= 0.001: 
                     last_anomaly = funding_state.get("anomaly", {}).get(symbol, 0)
                     if now - last_anomaly > 1800: # 1800 секунд = 30 минут
-                        send_funding_alert("🚨 Аномальный фандинг!", symbol, side, size, mark_price, funding_rate, target_time, rest)
+                        send_funding_alert(
+                            "🚨 Аномальный фандинг!",
+                            symbol,
+                            side,
+                            size,
+                            mark_price,
+                            funding_rate,
+                            target_time,
+                            rest,
+                            position_updated_time=str(pos.get("updatedTime") or ""),
+                        )
                         funding_state.setdefault("anomaly", {})[symbol] = now
 
                 # 2. Таймер: За 3 минуты до наступления (180 000 мс)
                 if 0 < time_to_funding_ms <= 180_000:
                     key = f"pre_{symbol}_{target_time}"
                     if not funding_state.get(key):
-                        send_funding_alert("⏳ Скоро списание фандинга (3 мин)", symbol, side, size, mark_price, funding_rate, target_time, rest)
+                        send_funding_alert(
+                            "⏳ Скоро списание фандинга (3 мин)",
+                            symbol,
+                            side,
+                            size,
+                            mark_price,
+                            funding_rate,
+                            target_time,
+                            rest,
+                            position_updated_time=str(pos.get("updatedTime") or ""),
+                        )
                         funding_state[key] = True
 
                 # 3. Таймер: Через 1-5 минут после наступления (чтобы с интервалом в 2 минуты гарантированно поймать)
                 if -300_000 < time_to_funding_ms <= -60_000: 
                     key = f"post_{symbol}_{target_time}"
                     if not funding_state.get(key):
-                        send_funding_alert("💸 Фактический отчет по фандингу", symbol, side, size, mark_price, funding_rate, target_time, rest)
+                        send_funding_alert(
+                            "💸 Фактический отчет по фандингу",
+                            symbol,
+                            side,
+                            size,
+                            mark_price,
+                            funding_rate,
+                            target_time,
+                            rest,
+                            position_updated_time=str(pos.get("updatedTime") or ""),
+                        )
                         funding_state[key] = True
 
         except Exception as e:
