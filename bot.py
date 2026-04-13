@@ -1,6 +1,7 @@
 import os
 import time
 import math
+import json
 import datetime as dt
 import logging
 import threading
@@ -17,7 +18,7 @@ load_dotenv()
 # ==========================
 # Config
 # ==========================
-BOT_VERSION = "1.6"
+BOT_VERSION = "1.7"
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
 BYBIT_TESTNET = os.environ.get("BYBIT_TESTNET", "0") == "1"
@@ -39,6 +40,9 @@ LIMIT_ORDER_ALERT_CATEGORIES = [
 ]
 POSITION_FUNDING_LOOKBACK_DAYS = max(7, int(os.environ.get("POSITION_FUNDING_LOOKBACK_DAYS", "30")))
 FUNDING_LOOKUP_TIMEOUT_SEC = max(1, int(os.environ.get("FUNDING_LOOKUP_TIMEOUT_SEC", "3")))
+TG_ALLOWED_USER_ID = os.environ.get("TELEGRAM_ALLOWED_USER_ID", "").strip()
+TG_COMMAND_POLL_TIMEOUT_SEC = max(1, int(os.environ.get("TG_COMMAND_POLL_TIMEOUT_SEC", "25")))
+TG_COMMAND_ERROR_SLEEP_SEC = max(1, int(os.environ.get("TG_COMMAND_ERROR_SLEEP_SEC", "5")))
 
 # Logging
 logging.basicConfig(
@@ -125,23 +129,205 @@ def calc_change_percent(direction: str, entry: Optional[float], exit_price: Opti
     return ((exit_price - entry) / entry) * 100.0
 
 
+INTERVAL_TO_MS: Dict[str, int] = {
+    "1": 60_000,
+    "3": 180_000,
+    "5": 300_000,
+    "15": 900_000,
+    "30": 1_800_000,
+    "60": 3_600_000,
+    "120": 7_200_000,
+    "240": 14_400_000,
+    "360": 21_600_000,
+    "720": 43_200_000,
+    "D": 86_400_000,
+    "W": 604_800_000,
+}
+
+
+def format_signed_percent(x: Optional[float], nd: int = 2) -> str:
+    if x is None:
+        return "n/a"
+    sign = "+" if x > 0 else ""
+    return f"{sign}{fmt_num(x, nd)}%"
+
+
+def format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    days, rem = divmod(total, 86_400)
+    hours, rem = divmod(rem, 3_600)
+    minutes, _ = divmod(rem, 60)
+    parts: List[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or parts:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+def safe_int(x: Any) -> int:
+    try:
+        return int(str(x or "0"))
+    except (ValueError, TypeError):
+        return 0
+
+
+def get_interval_ms(interval: str) -> Optional[int]:
+    return INTERVAL_TO_MS.get(str(interval))
+
+
+def parse_kline_rows(rows: List[List[Any]]) -> List[Dict[str, float]]:
+    parsed: List[Dict[str, float]] = []
+    for row in sorted(rows, key=lambda r: int(r[0])):
+        try:
+            parsed.append({
+                "start": float(row[0]),
+                "open": float(row[1]),
+                "high": float(row[2]),
+                "low": float(row[3]),
+                "close": float(row[4]),
+                "volume": float(row[5]),
+                "turnover": float(row[6]),
+            })
+        except (IndexError, TypeError, ValueError):
+            continue
+    return parsed
+
+
+def get_completed_klines(rows: List[Dict[str, float]], interval: str) -> List[Dict[str, float]]:
+    if not rows:
+        return []
+    interval_ms = get_interval_ms(interval)
+    if interval_ms is None:
+        return rows
+
+    now_ms = int(time.time() * 1000)
+    completed = list(rows)
+    if completed and now_ms < int(completed[-1]["start"]) + interval_ms:
+        completed.pop()
+    return completed
+
+
+def calc_rsi_from_closes(closes: List[float], length: int = 14) -> Optional[float]:
+    if len(closes) < length + 1:
+        return None
+    gains = []
+    losses = []
+    for i in range(1, len(closes)):
+        delta = closes[i] - closes[i - 1]
+        gains.append(max(delta, 0.0))
+        losses.append(max(-delta, 0.0))
+
+    avg_gain = sum(gains[:length]) / length
+    avg_loss = sum(losses[:length]) / length
+    for i in range(length, len(gains)):
+        avg_gain = (avg_gain * (length - 1) + gains[i]) / length
+        avg_loss = (avg_loss * (length - 1) + losses[i]) / length
+
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def calc_ema_from_closes(closes: List[float], period: int) -> Optional[float]:
+    if len(closes) < period:
+        return None
+    multiplier = 2.0 / (period + 1)
+    ema = sum(closes[:period]) / period
+    for price in closes[period:]:
+        ema = (price - ema) * multiplier + ema
+    return ema
+
+
+def calc_atr_from_rows(rows: List[Dict[str, float]], length: int = 14) -> Optional[float]:
+    if len(rows) < length + 1:
+        return None
+    true_ranges: List[float] = []
+    for i in range(1, len(rows)):
+        high = rows[i]["high"]
+        low = rows[i]["low"]
+        prev_close = rows[i - 1]["close"]
+        true_ranges.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    if len(true_ranges) < length:
+        return None
+    atr = sum(true_ranges[:length]) / length
+    for tr in true_ranges[length:]:
+        atr = (atr * (length - 1) + tr) / length
+    return atr
+
+
+def calc_volume_change_percent(rows: List[Dict[str, float]]) -> Optional[float]:
+    if len(rows) < 2:
+        return None
+    current = rows[-1]["turnover"]
+    previous = rows[-2]["turnover"]
+    if previous <= 0:
+        return None
+    return ((current - previous) / previous) * 100.0
+
+
+def resolve_price_vs_ema_band(price: Optional[float], ema20: Optional[float], ema50: Optional[float]) -> str:
+    if price is None or ema20 is None or ema50 is None:
+        return "n/a"
+    band_low = min(ema20, ema50)
+    band_high = max(ema20, ema50)
+    if price > band_high:
+        return "выше"
+    if price < band_low:
+        return "ниже"
+    return "внутри"
+
+
 # ==========================
 # Telegram
 # ==========================
-def tg_send_message(text: str) -> None:
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+def tg_api_request(method: str, *, params: Optional[Dict[str, Any]] = None, payload: Optional[Dict[str, Any]] = None, timeout: int = 15) -> Dict[str, Any]:
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/{method}"
+    if payload is not None:
+        response = requests.post(url, json=payload, timeout=timeout)
+    else:
+        response = requests.get(url, params=params, timeout=timeout)
+    if not response.ok:
+        raise RuntimeError(f"Telegram {method} failed: {response.status_code} {response.text}")
+    body = response.json()
+    if not body.get("ok"):
+        raise RuntimeError(f"Telegram {method} error: {json.dumps(body, ensure_ascii=False)}")
+    return body
+
+
+def tg_send_message(
+    text: str,
+    chat_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    reply_to_message_id: Optional[int] = None,
+) -> None:
     payload: Dict[str, Any] = {
-        "chat_id": TG_CHAT_ID,
+        "chat_id": chat_id or TG_CHAT_ID,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
-    if TG_THREAD_ID:
-        payload["message_thread_id"] = int(TG_THREAD_ID)
+    effective_thread_id = thread_id if thread_id is not None else TG_THREAD_ID
+    if effective_thread_id:
+        payload["message_thread_id"] = int(effective_thread_id)
+    if reply_to_message_id:
+        payload["reply_to_message_id"] = int(reply_to_message_id)
+        payload["allow_sending_without_reply"] = True
+    tg_api_request("sendMessage", payload=payload)
 
-    r = requests.post(url, json=payload, timeout=15)
-    if not r.ok:
-        raise RuntimeError(f"Telegram sendMessage failed: {r.status_code} {r.text}")
+
+def tg_get_updates(offset: Optional[int] = None, timeout_sec: int = TG_COMMAND_POLL_TIMEOUT_SEC) -> List[Dict[str, Any]]:
+    params: Dict[str, Any] = {
+        "timeout": timeout_sec,
+        "allowed_updates": json.dumps(["message"]),
+    }
+    if offset is not None:
+        params["offset"] = offset
+    body = tg_api_request("getUpdates", params=params, timeout=timeout_sec + 5)
+    result = body.get("result") or []
+    return result if isinstance(result, list) else []
 
 
 # ==========================
@@ -159,6 +345,8 @@ class BybitRest:
         self._position_cache: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
         self._rsi_cache: Dict[Tuple[str, str, str, int], Tuple[float, Optional[float]]] = {}
         self._funding_cache: Dict[Tuple[str, str, str, str], Tuple[float, Optional[Dict[str, Any]]]] = {}
+        self._kline_cache: Dict[Tuple[str, str, str, int], Tuple[float, List[Dict[str, float]]]] = {}
+        self._open_interest_cache: Dict[Tuple[str, str], Tuple[float, Optional[float]]] = {}
 
     def _cache_get(self, order_id: str, ttl_sec: int) -> Optional[Dict[str, Any]]:
         item = self._order_cache.get(order_id)
@@ -339,7 +527,14 @@ class BybitRest:
         try:
             resp = self.http.get_positions(category=category, settleCoin="USDT")
             lst = (((resp or {}).get("result") or {}).get("list") or [])
-            return [p for p in lst if to_float(p.get("size")) and to_float(p.get("size")) > 0]
+            result: List[Dict[str, Any]] = []
+            for item in lst:
+                size = to_float(item.get("size"))
+                if size and size > 0:
+                    enriched = dict(item)
+                    enriched["category"] = str(item.get("category") or category)
+                    result.append(enriched)
+            return result
         except Exception as e:
             log.warning(f"Failed to get open positions: {e}")
             return []
@@ -406,6 +601,61 @@ class BybitRest:
             or to_float(ticker.get("bid1Price"))
             or to_float(ticker.get("ask1Price"))
         )
+
+    def get_kline_rows(
+        self,
+        category: str,
+        symbol: str,
+        interval: str,
+        limit: int = 250,
+        cache_ttl_sec: int = 90,
+    ) -> List[Dict[str, float]]:
+        c = (category or "").lower()
+        if not c or not symbol:
+            return []
+
+        cache_key = (c, symbol, str(interval), limit)
+        cached = self._kline_cache.get(cache_key)
+        if cached and (time.time() - cached[0]) <= cache_ttl_sec:
+            return list(cached[1])
+
+        try:
+            resp = self.http.get_kline(category=c, symbol=symbol, interval=str(interval), limit=limit)
+            rows = parse_kline_rows((((resp or {}).get("result") or {}).get("list") or []))
+            self._kline_cache[cache_key] = (time.time(), rows)
+            return list(rows)
+        except Exception as e:
+            log.warning(f"Failed to get kline rows for {symbol} interval={interval}: {e}")
+            return []
+
+    def get_open_interest_value(self, category: str, symbol: str, interval_time: str = "5min", cache_ttl_sec: int = 120) -> Optional[float]:
+        c = (category or "").lower()
+        if not c or not symbol:
+            return None
+
+        cache_key = (c, symbol)
+        cached = self._open_interest_cache.get(cache_key)
+        if cached and (time.time() - cached[0]) <= cache_ttl_sec:
+            return cached[1]
+
+        value = None
+        ticker = self.get_ticker_info(c, symbol)
+        value = (
+            to_float(ticker.get("openInterestValue"))
+            or to_float(ticker.get("openInterest"))
+        )
+
+        if value is None and c in {"linear", "inverse"}:
+            try:
+                resp = self.http.get_open_interest(category=c, symbol=symbol, intervalTime=interval_time, limit=1)
+                rows = (((resp or {}).get("result") or {}).get("list") or [])
+                if rows:
+                    value = to_float(rows[0].get("openInterest"))
+            except Exception as e:
+                log.warning(f"Failed to get open interest for {symbol}: {e}")
+
+        self._open_interest_cache[cache_key] = (time.time(), value)
+        return value
 
     def get_position_funding_total(
         self,
@@ -689,12 +939,12 @@ funding_state = {
 }
 
 
-def resolve_funding_total_text(
+def resolve_funding_total(
     rest: BybitRest,
     symbol: str,
     side: str,
     position_created_time: str,
-) -> str:
+) -> Optional[Dict[str, Any]]:
     executor = cf.ThreadPoolExecutor(max_workers=1)
     future = executor.submit(
         rest.get_position_funding_total,
@@ -713,13 +963,27 @@ def resolve_funding_total_text(
             side,
             FUNDING_LOOKUP_TIMEOUT_SEC,
         )
-        return "n/a"
+        return None
     except Exception as e:
         log.warning("Funding total lookup failed for symbol=%s side=%s: %s", symbol, side, e)
-        return "n/a"
+        return None
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
 
+    return funding_total
+
+
+def resolve_funding_total_text(
+    rest: BybitRest,
+    symbol: str,
+    side: str,
+    position_created_time: str,
+) -> str:
+    funding_total = resolve_funding_total(rest, symbol, side, position_created_time)
+    return format_funding_total_text(funding_total)
+
+
+def format_funding_total_text(funding_total: Optional[Dict[str, Any]]) -> str:
     if funding_total is None:
         return "n/a"
 
@@ -875,6 +1139,234 @@ def funding_monitor_loop(rest: BybitRest):
 
         # Сон 120 секунд (2 минуты)
         time.sleep(120)
+
+
+# ==========================
+# Positions Command
+# ==========================
+def is_positions_command(text: str) -> bool:
+    normalized = (text or "").strip().split()[0].lower() if (text or "").strip() else ""
+    return normalized == "/positions" or normalized.startswith("/positions@")
+
+
+def should_handle_command_message(message: Dict[str, Any]) -> bool:
+    chat = message.get("chat") or {}
+    chat_id = str(chat.get("id") or "")
+    if TG_CHAT_ID and chat_id != TG_CHAT_ID:
+        return False
+
+    if TG_THREAD_ID:
+        thread_id = str(message.get("message_thread_id") or "")
+        if thread_id != TG_THREAD_ID:
+            return False
+
+    from_user = message.get("from") or {}
+    if from_user.get("is_bot"):
+        return False
+
+    if TG_ALLOWED_USER_ID and str(from_user.get("id") or "") != TG_ALLOWED_USER_ID:
+        return False
+
+    return is_positions_command(str(message.get("text") or ""))
+
+
+def format_position_age(position: Dict[str, Any]) -> str:
+    opened_at_ms = safe_int(position.get("createdTime") or position.get("updatedTime"))
+    if opened_at_ms <= 0:
+        return "n/a"
+    local_dt, utc_off = utc_to_local(opened_at_ms, UTC_OFFSET_HOURS)
+    age = format_duration((time.time() * 1000 - opened_at_ms) / 1000.0)
+    return f"{local_dt} ({utc_off}) | {age}"
+
+
+def calc_liq_distance_percent(current_price: Optional[float], liq_price: Optional[float]) -> Optional[float]:
+    if current_price is None or liq_price is None or current_price <= 0 or liq_price <= 0:
+        return None
+    return abs(current_price - liq_price) / current_price * 100.0
+
+
+def calc_position_pnl_percent(entry_price: Optional[float], size: float, pnl_value: Optional[float]) -> Optional[float]:
+    if entry_price is None or entry_price <= 0 or size <= 0 or pnl_value is None:
+        return None
+    notional = entry_price * size
+    if notional <= 0:
+        return None
+    return (pnl_value / notional) * 100.0
+
+
+def build_indicator_snapshot(rest: BybitRest, category: str, symbol: str, current_price: Optional[float]) -> Dict[str, Any]:
+    intervals = {
+        "24h": "D",
+        "4h": "240",
+        "1h": "60",
+        "15m": "15",
+    }
+    data: Dict[str, Any] = {
+        "volume_change": {},
+        "rsi": {},
+        "atr": {},
+        "ema_24h": {"ema20": None, "ema50": None, "position": "n/a"},
+        "open_interest": rest.get_open_interest_value(category, symbol),
+    }
+
+    completed_by_label: Dict[str, List[Dict[str, float]]] = {}
+    for label, interval in intervals.items():
+        rows = rest.get_kline_rows(category, symbol, interval=interval, limit=250)
+        completed = get_completed_klines(rows, interval)
+        completed_by_label[label] = completed
+        closes = [row["close"] for row in completed]
+
+        data["volume_change"][label] = calc_volume_change_percent(completed)
+        data["rsi"][label] = calc_rsi_from_closes(closes, length=14)
+
+        if label != "24h":
+            data["atr"][label] = calc_atr_from_rows(completed, length=14)
+
+    daily_closes = [row["close"] for row in completed_by_label["24h"]]
+    ema20 = calc_ema_from_closes(daily_closes, 20)
+    ema50 = calc_ema_from_closes(daily_closes, 50)
+    data["ema_24h"] = {
+        "ema20": ema20,
+        "ema50": ema50,
+        "position": resolve_price_vs_ema_band(current_price, ema20, ema50),
+    }
+    return data
+
+
+def build_position_message(position: Dict[str, Any], rest: BybitRest) -> str:
+    category = str(position.get("category") or "linear").lower()
+    symbol = str(position.get("symbol") or "n/a")
+    side = str(position.get("side") or "")
+    direction = "Long" if side.lower() == "buy" else "Short"
+    size = to_float(position.get("size")) or 0.0
+    entry_price = (
+        to_float(position.get("avgPrice"))
+        or to_float(position.get("avgEntryPrice"))
+        or to_float(position.get("entryPrice"))
+    )
+    current_price = (
+        to_float(position.get("markPrice"))
+        or rest.get_current_price(category, symbol)
+    )
+    leverage = to_float(position.get("leverage"))
+    liq_price = to_float(position.get("liqPrice"))
+    unrealized_pnl = to_float(position.get("unrealisedPnl"))
+    if unrealized_pnl is None:
+        unrealized_pnl = to_float(position.get("unrealizedPnl"))
+    position_created_time = str(position.get("createdTime") or position.get("updatedTime") or "")
+    funding_total = resolve_funding_total(rest, symbol, side, position_created_time)
+    funding_value = to_float((funding_total or {}).get("funding")) or 0.0
+    pnl_with_funding = (unrealized_pnl or 0.0) + funding_value
+    pnl_pct = calc_position_pnl_percent(entry_price, size, pnl_with_funding)
+    liq_distance_pct = calc_liq_distance_percent(current_price, liq_price)
+
+    indicators = build_indicator_snapshot(rest, category, symbol, current_price)
+    ema_24h = indicators["ema_24h"]
+    bybit_link = rest.make_bybit_link(category, symbol)
+    tv_link = rest.make_tv_link(symbol)
+
+    lines = [
+        f"📌 <b>Открытая позиция: {symbol}</b>",
+        "",
+        f"<b>Символ:</b> {symbol}",
+        f"<b>Side:</b> {direction}",
+        f"<b>Размер позиции:</b> {fmt_num(size)}",
+        f"<b>Средняя цена входа:</b> {fmt_num(entry_price)}",
+        f"<b>Текущая цена:</b> {fmt_num(current_price)}",
+        f"<b>Unrealized PnL + funding:</b> {fmt_num(pnl_with_funding, 4)} USDT",
+        f"<b>PnL (%):</b> {format_signed_percent(pnl_pct)}",
+        f"<b>Leverage:</b> {fmt_num(leverage, 2)}x" if leverage is not None else "<b>Leverage:</b> n/a",
+        f"<b>До ликвидации:</b> {fmt_num(liq_distance_pct, 2)}%" if liq_distance_pct is not None else "<b>До ликвидации:</b> n/a",
+        f"<b>Время жизни позиции:</b> {format_position_age(position)}",
+        f"<b>Funding по позиции:</b> {format_funding_total_text(funding_total)}",
+        "",
+        (
+            "<b>Изменение объема:</b> "
+            f"24h {format_signed_percent(indicators['volume_change'].get('24h'))} | "
+            f"4h {format_signed_percent(indicators['volume_change'].get('4h'))} | "
+            f"1h {format_signed_percent(indicators['volume_change'].get('1h'))} | "
+            f"15m {format_signed_percent(indicators['volume_change'].get('15m'))}"
+        ),
+        (
+            "<b>RSI:</b> "
+            f"24h {fmt_num(indicators['rsi'].get('24h'), 2) if indicators['rsi'].get('24h') is not None else 'n/a'} | "
+            f"4h {fmt_num(indicators['rsi'].get('4h'), 2) if indicators['rsi'].get('4h') is not None else 'n/a'} | "
+            f"1h {fmt_num(indicators['rsi'].get('1h'), 2) if indicators['rsi'].get('1h') is not None else 'n/a'} | "
+            f"15m {fmt_num(indicators['rsi'].get('15m'), 2) if indicators['rsi'].get('15m') is not None else 'n/a'}"
+        ),
+        (
+            f"<b>EMA20/EMA50 (24h):</b> {fmt_num(ema_24h.get('ema20'))} / {fmt_num(ema_24h.get('ema50'))} | "
+            f"цена {ema_24h.get('position')}"
+        ),
+        (
+            "<b>ATR:</b> "
+            f"4h {fmt_num(indicators['atr'].get('4h'), 4) if indicators['atr'].get('4h') is not None else 'n/a'} | "
+            f"1h {fmt_num(indicators['atr'].get('1h'), 4) if indicators['atr'].get('1h') is not None else 'n/a'} | "
+            f"15m {fmt_num(indicators['atr'].get('15m'), 4) if indicators['atr'].get('15m') is not None else 'n/a'}"
+        ),
+        f"<b>Open interest:</b> {fmt_num(indicators.get('open_interest'), 2) if indicators.get('open_interest') is not None else 'n/a'}",
+        "",
+        f"🔗 <a href='{bybit_link}'>Bybit</a> | <a href='{tv_link}'>TradingView</a>",
+    ]
+    return "\n".join(lines)
+
+
+def send_positions_report(message: Dict[str, Any], rest: BybitRest) -> None:
+    chat_id = str((message.get("chat") or {}).get("id") or TG_CHAT_ID)
+    thread_id = str(message.get("message_thread_id") or "") if message.get("message_thread_id") is not None else None
+    reply_to_message_id = safe_int(message.get("message_id"))
+
+    positions = rest.get_all_open_positions("linear")
+    if not positions:
+        tg_send_message(
+            "Открытых позиций сейчас нет.",
+            chat_id=chat_id,
+            thread_id=thread_id,
+            reply_to_message_id=reply_to_message_id,
+        )
+        return
+
+    positions_sorted = sorted(positions, key=lambda p: safe_int(p.get("createdTime") or p.get("updatedTime")))
+    for position in positions_sorted:
+        tg_send_message(
+            build_position_message(position, rest),
+            chat_id=chat_id,
+            thread_id=thread_id,
+            reply_to_message_id=reply_to_message_id,
+        )
+
+
+def telegram_command_loop(rest: BybitRest) -> None:
+    offset: Optional[int] = None
+    try:
+        initial_updates = tg_get_updates(timeout_sec=1)
+        if initial_updates:
+            offset = max(safe_int(item.get("update_id")) for item in initial_updates) + 1
+    except Exception as e:
+        log.warning(f"Failed to initialize Telegram command offset: {e}")
+
+    while True:
+        try:
+            updates = tg_get_updates(offset=offset, timeout_sec=TG_COMMAND_POLL_TIMEOUT_SEC)
+            for update in updates:
+                offset = safe_int(update.get("update_id")) + 1
+                message = update.get("message") or {}
+                if not should_handle_command_message(message):
+                    continue
+                try:
+                    send_positions_report(message, rest)
+                    log.info("Processed Telegram /positions command chatId=%s", (message.get("chat") or {}).get("id"))
+                except Exception as e:
+                    log.exception(f"Failed handling /positions command: {e}")
+                    tg_send_message(
+                        "Не удалось собрать snapshot по позициям. Попробуй еще раз через минуту.",
+                        chat_id=str((message.get("chat") or {}).get("id") or TG_CHAT_ID),
+                        thread_id=str(message.get("message_thread_id") or "") if message.get("message_thread_id") is not None else None,
+                        reply_to_message_id=safe_int(message.get("message_id")),
+                    )
+        except Exception as e:
+            log.exception(f"Telegram command loop error: {e}")
+            time.sleep(TG_COMMAND_ERROR_SLEEP_SEC)
 
 
 # ==========================
@@ -1269,6 +1761,9 @@ def main() -> None:
 
     limit_order_thread = threading.Thread(target=limit_order_monitor_loop, args=(rest,), daemon=True, name="limit-order-monitor-loop")
     limit_order_thread.start()
+
+    telegram_command_thread = threading.Thread(target=telegram_command_loop, args=(rest,), daemon=True, name="telegram-command-loop")
+    telegram_command_thread.start()
 
     ws = WebSocket(
         testnet=BYBIT_TESTNET,
