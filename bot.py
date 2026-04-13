@@ -18,7 +18,7 @@ load_dotenv()
 # ==========================
 # Config
 # ==========================
-BOT_VERSION = "1.7"
+BOT_VERSION = "1.8"
 BYBIT_API_KEY = os.environ.get("BYBIT_API_KEY", "").strip()
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
 BYBIT_TESTNET = os.environ.get("BYBIT_TESTNET", "0") == "1"
@@ -1152,13 +1152,18 @@ def is_positions_command(text: str) -> bool:
 def should_handle_command_message(message: Dict[str, Any]) -> bool:
     chat = message.get("chat") or {}
     chat_id = str(chat.get("id") or "")
-    if TG_CHAT_ID and chat_id != TG_CHAT_ID:
-        return False
+    chat_type = str(chat.get("type") or "")
 
-    if TG_THREAD_ID:
-        thread_id = str(message.get("message_thread_id") or "")
-        if thread_id != TG_THREAD_ID:
+    if chat_type == "private":
+        pass
+    else:
+        if TG_CHAT_ID and chat_id != TG_CHAT_ID:
             return False
+
+        if TG_THREAD_ID:
+            thread_id = str(message.get("message_thread_id") or "")
+            if thread_id != TG_THREAD_ID:
+                return False
 
     from_user = message.get("from") or {}
     if from_user.get("is_bot"):
